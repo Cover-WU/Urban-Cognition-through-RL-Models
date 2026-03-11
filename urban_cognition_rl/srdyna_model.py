@@ -1,0 +1,615 @@
+"""
+Model-Based SR-Dyna RL estimation with Successor Representation.
+"""
+
+import numpy as np
+import warnings
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Any, Set
+from collections import defaultdict
+from itertools import chain
+from scipy.optimize import minimize
+
+from .utils import compute_day_sequence, compute_time_angle, compute_reward_array
+
+
+@dataclass
+class SRDynaConfig:
+    """Configuration for SR Dyna model."""
+    alpha_init: float = 0.1
+    alpha_plan: float = 0.1
+    beta_init: float = 1.0
+    epsilon_init: float = 0.1
+    phi_init: float = 0.1
+    n_planning_steps: int = 15
+    reward_type: str = 'log'
+    reward_param_init: float = 1.0
+    visit_threshold: int = 3
+    memory_threshold: float = 0.01
+    selection_size: int = None
+    sigma_t_init: float = 1.0 / 12.0
+    maxiter: int = 1000
+    ftol: float = 1e-6
+
+
+@dataclass
+class SRRecord:
+    """A single SR memory record for one (state, action) pair at a specific time."""
+    sr: np.ndarray
+    time_angle: float
+    day_seq: int
+    record_date: int
+    strength: float = 1.0
+
+
+class WorldModel:
+    """Online learning world model for SR-Dyna planning."""
+
+    def __init__(self, config: Optional[SRDynaConfig] = None):
+        self.config = config if config is not None else SRDynaConfig()
+        self.sigma_t = config.sigma_t_init if config else 1.0 / 12.0
+        self.DAY_THRESHOLD_HOUR = 3
+        self.action_time_transitions: Dict[int, List[Tuple[float, float]]] = defaultdict(list)
+        self.state_visit_times: Dict[int, List[float]] = defaultdict(list)
+        self.state_rewards: Dict[int, List[float]] = defaultdict(list)
+        self.state_visit_counts: Dict[int, int] = defaultdict(int)
+
+    @staticmethod
+    def _time_kernel(t1: float, t2: float, sigma: float) -> float:
+        """Gaussian kernel for time similarity."""
+        diff = abs(float(t1) - float(t2))
+        diff = min(diff, 1.0 - diff)
+        return float(np.exp(-0.5 * (diff / sigma) ** 2))
+
+    def update(self, state: int, action: int, time_angle: float,
+               reward: float, day_continues: bool, next_time_angle: float = None):
+        """Update world model with observed transition."""
+        self.state_visit_counts[state] += 1
+        self.state_visit_times[state].append(time_angle)
+        self.state_rewards[state].append(reward)
+
+        if day_continues and next_time_angle is not None:
+            time_delta = next_time_angle - time_angle
+            if time_delta < 0:
+                time_delta += 1.0
+            self.action_time_transitions[action].append((time_angle, time_delta))
+
+    def predict_next_time(self, state: int, action: int, time_angle: float = None) -> float:
+        """Predict time delta to reach next state."""
+        transitions = self.action_time_transitions.get(action, [])
+        remaining_time = 1.0 - time_angle
+        kernel_threshold = 3.0 * self.sigma_t
+
+        valid_transitions = []
+        for t, delta in transitions:
+            time_diff = abs(time_angle - t)
+            if time_diff <= kernel_threshold:
+                valid_transitions.append((t, delta))
+
+        if len(valid_transitions) < 3:
+            return remaining_time * 0.5
+
+        total_weight = 0.0
+        weighted_sum = 0.0
+        for t, delta in valid_transitions:
+            weight = self._time_kernel(time_angle, t, self.sigma_t)
+            total_weight += weight
+            weighted_sum += weight * delta
+
+        time_delta = weighted_sum / total_weight
+        return float(np.clip(time_delta, 0, remaining_time * 0.95))
+
+    def predict_reward(self, state: int) -> float:
+        """Predict average reward at given state."""
+        if state not in self.state_rewards or not self.state_rewards[state]:
+            return 0.0
+        return float(np.mean(self.state_rewards[state]))
+
+
+class SRMemory:
+    """Memory structure for Successor Representation."""
+
+    def __init__(self, phi: float, config: Optional[SRDynaConfig] = None):
+        self.config = config if config is not None else SRDynaConfig()
+        self.phi = phi
+        self.SR: Dict[int, Dict[int, List[SRRecord]]] = defaultdict(lambda: defaultdict(list))
+        self.SR_decay: Dict[int, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+        self.node_visits: Dict[int, int] = defaultdict(int)
+        self.node_strength: Dict[int, float] = defaultdict(float)
+        self._active_states: Optional[Set[int]] = None
+        self.last_day: Optional[int] = None
+        self.exploration_rewards: List[float] = []
+
+    def add_record(self, node_id: int, action_id: int, time_angle: float,
+                   sr_array: np.ndarray, day_seq: int, record_date: int,
+                   strength: float = 1.0):
+        """Add an SR record to memory."""
+        rec = SRRecord(
+            sr=np.array(sr_array, dtype=np.float64),
+            time_angle=float(time_angle),
+            day_seq=int(day_seq),
+            record_date=int(record_date),
+            strength=float(strength),
+        )
+        self.SR[node_id][action_id].append(rec)
+        self.SR_decay[node_id][action_id] = 1.0
+        self.node_strength[node_id] = self.node_strength.get(node_id, 0.0) + 1.0
+        self.node_visits[node_id] = self.node_visits.get(node_id, 0) + 1
+        self._active_states = None
+
+    @staticmethod
+    def compute_time_similarity(t1: float, t2: float, sigma_t: float) -> float:
+        """Circular Gaussian kernel on normalized time angle [0, 1)."""
+        diff = abs(float(t1) - float(t2))
+        sigma = max(float(sigma_t), 1e-6)
+        return float(np.exp(-0.5 * (diff / sigma) ** 2))
+
+    def get_records_for_sa_pair(self, node_id: int, action_id: int) -> List[SRRecord]:
+        """Get all SR records for (node_id, action_id) pair."""
+        return self.SR.get(int(node_id), {}).get(int(action_id), [])
+
+    def add_exploration_reward(self, reward: float):
+        """Record a reward obtained from exploration action."""
+        self.exploration_rewards.append(float(reward))
+
+    def get_exploration_reward_mean(self) -> float:
+        """Get average reward from all exploration actions."""
+        if not self.exploration_rewards:
+            return 0.0
+        return float(np.mean(self.exploration_rewards))
+
+    def retrieve_sr(self, node_id: int, action_id: int, target_time: float,
+                    sigma_t: Optional[float] = None) -> np.ndarray:
+        """Retrieve SR vector for (node_id, action_id) at target time."""
+        sigma = self.config.sigma_t_init if sigma_t is None else float(sigma_t)
+
+        if action_id == -9:
+            return visited_onehot(action_id, node_id, self.config.selection_size)
+
+        recs = self.get_records_for_sa_pair(node_id, action_id)
+        if not recs:
+            return np.zeros(self.config.selection_size + 2, dtype=np.float64)
+
+        sr_arrays = np.array([rec.sr for rec in recs], dtype=np.float64)
+        strengths = np.array([rec.strength for rec in recs], dtype=np.float64)
+        similarities = np.array([
+            self.compute_time_similarity(target_time, rec.time_angle, sigma)
+            for rec in recs
+        ])
+
+        weights = similarities * strengths
+
+        if weights.sum() <= 0:
+            return np.zeros(self.config.selection_size + 2, dtype=np.float64)
+
+        sr_estimate = np.average(sr_arrays, weights=weights, axis=0)
+        return sr_estimate
+
+    def sr_is_empty(self) -> bool:
+        """Check the validity of SR."""
+        return not any(chain(*[self.SR[s][a] for s in self.SR for a in self.SR[s]]))
+
+    def decay(self, current_day: int):
+        """Apply memory decay when day changes."""
+        if self.last_day is None:
+            self.last_day = current_day
+            return
+
+        day_diff = int(current_day - self.last_day)
+        if day_diff > 0:
+            factor = (1.0 - self.phi) ** day_diff
+            for s in self.SR:
+                for a in self.SR[s]:
+                    for rec in self.SR[s][a]:
+                        rec.strength *= factor
+            for node_id in self.node_strength:
+                self.node_strength[node_id] *= factor
+                for action_id in self.SR_decay[node_id]:
+                    self.SR_decay[node_id][action_id] *= factor
+            self._active_states = None
+
+        self.last_day = current_day
+
+    def get_active_states(self) -> Set[int]:
+        """Get states with memory strength above threshold."""
+        if self._active_states is not None:
+            return self._active_states
+        self._active_states = {
+            state_id
+            for state_id, strength in self.node_strength.items()
+            if strength >= self.config.memory_threshold
+            and self.node_visits.get(state_id, 0) >= self.config.visit_threshold
+        }
+        return self._active_states
+
+    def sample_random_sa(self) -> Optional[Tuple[int, int]]:
+        """Randomly sample a (state, action) pair from memory for planning."""
+        if self.sr_is_empty():
+            return None
+
+        valid_pairs = []
+        for s in self.SR:
+            for a in self.SR[s]:
+                if a > 0:
+                    valid_pairs.append((s, a))
+
+        states_in_pairs = list(set([s for s, a in valid_pairs]))
+        state_weights = []
+        for s in states_in_pairs:
+            count = len([a for s_pair, a in valid_pairs if s == s_pair])
+            state_weights.append(count)
+
+        total = sum(state_weights)
+        probs = [w / total for w in state_weights]
+        sampled_state = np.random.choice(states_in_pairs, p=probs)
+        actions_for_state = [a for s, a in valid_pairs if s == sampled_state]
+        sampled_action = np.random.choice(actions_for_state)
+
+        return (sampled_state, sampled_action)
+
+
+def visited_onehot(action: int, current_state: int, selection_size: int) -> np.ndarray:
+    """Create one-hot encoding for visited state."""
+    idx = 0 if action == 0 else (int(action) if action > 0 else selection_size + 1)
+    return np.eye(selection_size + 2)[idx]
+
+
+def compute_Q(node_id: int, action_id: int, target_time: float,
+             memory: SRMemory, model: WorldModel,
+             sigma_t: Optional[float] = None) -> float:
+    """Compute Q(s, a) using Successor Representation and world model."""
+    sigma = memory.config.sigma_t_init if sigma_t is None else float(sigma_t)
+    selection_size = memory.config.selection_size
+
+    sr_vector = memory.retrieve_sr(node_id, action_id, target_time, sigma)
+
+    reward_vector = np.zeros(selection_size + 2, dtype=np.float64)
+    for s in range(1, selection_size + 1):
+        reward_vector[s] = model.predict_reward(s)
+
+    exploration_reward = memory.get_exploration_reward_mean()
+    reward_vector[-1] = exploration_reward
+
+    q_value = float(np.dot(sr_vector, reward_vector))
+    return q_value
+
+
+def prepare_sr_dyna_data(user_df: pd.DataFrame,
+                        config: Optional[SRDynaConfig] = None) -> Dict[str, Any]:
+    """Prepare trajectory data for SR Dyna modeling."""
+    config = config if config is not None else SRDynaConfig()
+
+    df = user_df.sort_values('t_start').reset_index(drop=True)
+    n_records = len(df)
+
+    states = df['cluster_id'].astype(int).to_numpy()
+    date_array = df['date'].to_numpy()
+    anchor_size = int(np.max(states)) if len(states) > 0 else 0
+
+    time_angles = np.zeros(n_records)
+    for i, t_end in enumerate(df['t_end']):
+        time_angles[i] = compute_time_angle(t_end)
+
+    date_baseline = int(date_array.min())
+    day_seq = compute_day_sequence(date_array, date_baseline)
+
+    stay_minutes = (df['t_end'] - df['t_start']).dt.total_seconds() / 60.0
+    stay_minutes = stay_minutes.to_numpy()
+    stay_minutes = np.roll(stay_minutes, -1)
+    stay_minutes[-1] = 0.0
+
+    actions = np.zeros(n_records, dtype=int)
+    actions[-1] = -9
+    for t in range(n_records - 1):
+        if day_seq[t + 1] > day_seq[t]:
+            actions[t] = -9
+        else:
+            actions[t] = int(states[t + 1])
+
+    same_day_next = np.zeros(n_records, dtype=bool)
+    for t in range(n_records - 1):
+        same_day_next[t] = day_seq[t] == day_seq[t + 1]
+
+    return {
+        'states': states,
+        'actions': actions,
+        'day_seq': day_seq,
+        'time_angles': time_angles,
+        'date_array': date_array,
+        'stay_minutes': stay_minutes,
+        'same_day_next': same_day_next,
+        'n_records': n_records,
+        'selection_size': anchor_size,
+    }
+
+
+def unpack_params_sr_dyna(theta: np.ndarray) -> Dict[str, float]:
+    """Unpack SR-Dyna parameters from optimization vector."""
+    idx = 0
+    alpha = 1.0 / (1.0 + np.exp(-theta[idx])); idx += 1
+    beta = np.exp(theta[idx]); idx += 1
+    epsilon = 1.0 / (1.0 + np.exp(-theta[idx])); idx += 1
+    phi = 1.0 / (1.0 + np.exp(-theta[idx])); idx += 1
+
+    alpha = float(np.clip(alpha, 1e-6, 1.0))
+    epsilon = float(np.clip(epsilon, 1e-6, 1.0 - 1e-6))
+
+    return {
+        'alpha': alpha,
+        'beta': float(beta),
+        'epsilon': epsilon,
+        'phi': float(phi),
+    }
+
+
+def pack_params_sr_dyna(alpha: float, beta: float, epsilon: float, phi: float) -> np.ndarray:
+    """Pack SR-Dyna parameters for optimization."""
+    return np.array([
+        np.log(alpha / (1.0 - alpha)),
+        np.log(beta),
+        np.log(epsilon / (1.0 - epsilon)),
+        np.log(phi / (1.0 - phi)),
+    ], dtype=np.float64)
+
+
+def simulate_and_loglik_sr_dyna(theta: np.ndarray,
+                                sr_data: Dict[str, Any],
+                                config: Optional[SRDynaConfig] = None) -> float:
+    """Negative log-likelihood for SR-Dyna model."""
+    config = config if config is not None else SRDynaConfig()
+
+    params = unpack_params_sr_dyna(theta)
+    alpha = params['alpha']
+    beta = params['beta']
+    epsilon = params['epsilon']
+    phi = params['phi']
+
+    states = sr_data['states']
+    actions = sr_data['actions']
+    day_seq = sr_data['day_seq']
+    time_angles = sr_data['time_angles']
+    date_array = sr_data['date_array']
+    same_day_next = sr_data['same_day_next']
+    n_records = sr_data['n_records']
+    selection_size = sr_data['selection_size']
+    config.selection_size = selection_size
+
+    reward_array = compute_reward_array(
+        sr_data['stay_minutes'],
+        config.reward_type,
+        config.reward_param_init,
+    )
+
+    visit_counts: Dict[int, int] = defaultdict(int)
+    known_states: Set[int] = {-1, 0}
+    known_actions: Set[int] = {-9, -1, 0}
+
+    memory = SRMemory(phi, config)
+    model = WorldModel(config)
+
+    loglik = 0.0
+
+    for t in range(n_records):
+        s = int(states[t])
+        a = int(actions[t])
+        r_t = float(reward_array[t])
+        current_day = int(day_seq[t])
+        current_date = int(date_array[t])
+        time_angle = float(time_angles[t])
+
+        memory.decay(current_day)
+
+        if a > 0:
+            visit_counts[a] += 1
+            if visit_counts[a] >= config.visit_threshold:
+                known_states.add(a)
+                known_actions.add(a)
+
+        s_perc = s if s in known_states else -1
+        a_perc = a if a in known_actions else -1
+
+        evaluated_actions = sorted([act for act in known_actions if act != -1])
+
+        if len(evaluated_actions) == 0:
+            action_prob = np.clip(epsilon, 1e-12, 1.0)
+        else:
+            q_values = np.array([
+                compute_Q(s_perc, act, time_angle, memory, model, config.sigma_t_init)
+                for act in evaluated_actions
+            ], dtype=float)
+
+            beta_q = beta * q_values
+            beta_q -= np.max(beta_q)
+            softmax = np.exp(beta_q)
+            softmax /= (np.sum(softmax) + 1e-12)
+
+            probs = (1.0 - epsilon) * softmax
+
+            if a_perc in evaluated_actions:
+                idx_a = evaluated_actions.index(a_perc)
+                action_prob = float(np.clip(probs[idx_a], 1e-12, 1.0))
+            else:
+                action_prob = float(np.clip(epsilon, 1e-12, 1.0))
+
+        loglik += np.log(action_prob)
+
+        # Update world model
+        day_continues = t < n_records - 1 and same_day_next[t]
+        next_time_angle = float(time_angles[t + 1]) if day_continues else None
+
+        if a_perc != -1:
+            model.update(s_perc, a_perc, time_angle, r_t, day_continues, next_time_angle)
+        else:
+            memory.add_exploration_reward(r_t)
+
+        # TD update for SR
+        if t < n_records - 1 and same_day_next[t]:
+            a_next = int(actions[t + 1])
+            a_next_perc = a_next if a_next in known_actions else -1
+            time_angle_next = float(time_angles[t + 1])
+
+            next_sr = memory.retrieve_sr(a_perc, a_next_perc, time_angle_next, config.sigma_t_init)
+            current_sr = memory.retrieve_sr(s_perc, a_perc, time_angle, config.sigma_t_init)
+
+            onehot = visited_onehot(a_perc, s_perc, selection_size)
+            target_sr = onehot + next_sr
+            delta_sr = target_sr - current_sr
+            new_sr = current_sr + alpha * delta_sr
+
+            memory.add_record(s_perc, a_perc, time_angle, new_sr, current_day, current_date)
+
+        # Dyna planning
+        valid_planning_steps = 0
+        while valid_planning_steps < config.n_planning_steps:
+            sampled = memory.sample_random_sa()
+            if sampled is None:
+                break
+            plan_s, plan_a = sampled
+            if plan_a < 0:
+                continue
+
+            plan_records = memory.get_records_for_sa_pair(plan_s, plan_a)
+            new_sr_records = []
+            for rec in plan_records:
+                plan_time = rec.time_angle
+                plan_next_time_delta = model.predict_next_time(plan_s, plan_a, plan_time)
+                plan_next_time = plan_time + plan_next_time_delta
+
+                plan_a_actions = set(memory.SR.get(plan_a, {}).keys())
+                plan_a_actions = list(plan_a_actions | {0, -9})
+
+                best_q = -np.inf
+                for a_next in plan_a_actions:
+                    q = compute_Q(plan_a, a_next, plan_next_time, memory, model, config.sigma_t_init)
+                    if q > best_q:
+                        best_q = q
+                        optimal_a = a_next
+
+                next_sr_optimal = memory.retrieve_sr(plan_a, optimal_a, plan_next_time, config.sigma_t_init)
+                onehot = visited_onehot(plan_a, plan_s, selection_size)
+                target_sr_plan = onehot + next_sr_optimal
+                current_sr_plan = memory.retrieve_sr(plan_s, plan_a, plan_time, config.sigma_t_init)
+                delta_sr_plan = target_sr_plan - current_sr_plan
+                new_sr_plan = current_sr_plan + config.alpha_plan * delta_sr_plan
+
+                new_rec = SRRecord(
+                    sr=new_sr_plan.copy(),
+                    time_angle=rec.time_angle,
+                    day_seq=rec.day_seq,
+                    record_date=rec.record_date,
+                    strength=rec.strength,
+                )
+                new_sr_records.append(new_rec)
+            valid_planning_steps += 1
+            memory.update_records_for_sa_pair(plan_s, plan_a, new_sr_records)
+
+    return -loglik
+
+
+def fit_sr_dyna_model(user_df: pd.DataFrame,
+                     config: Optional[SRDynaConfig] = None,
+                     verbose: bool = True) -> Dict[str, Any]:
+    """Fit SR Dyna model for one user."""
+    config = config if config is not None else SRDynaConfig()
+
+    sr_data = prepare_sr_dyna_data(user_df, config)
+    n_records = sr_data['n_records']
+
+    if n_records < 2:
+        return {
+            'n_records': int(n_records),
+            'log_likelihood': np.nan,
+            'AIC': np.nan,
+            'BIC': np.nan,
+            'alpha': np.nan,
+            'beta': np.nan,
+            'epsilon': np.nan,
+            'phi': np.nan,
+            'converged': False,
+            'n_iterations': 0,
+            'optimization_message': 'Insufficient records',
+        }
+
+    theta_init = pack_params_sr_dyna(
+        alpha=config.alpha_init,
+        beta=config.beta_init,
+        epsilon=config.epsilon_init,
+        phi=config.phi_init,
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        result = minimize(
+            simulate_and_loglik_sr_dyna,
+            theta_init,
+            args=(sr_data, config),
+            method='L-BFGS-B',
+            options={'maxiter': config.maxiter, 'ftol': config.ftol, 'disp': False},
+        )
+
+    fitted = unpack_params_sr_dyna(result.x)
+    log_likelihood = -float(result.fun)
+
+    k_params = 4
+    aic = 2 * k_params - 2 * log_likelihood
+    bic = k_params * np.log(max(n_records, 1)) - 2 * log_likelihood
+
+    return {
+        'n_records': int(n_records),
+        'log_likelihood': log_likelihood,
+        'AIC': aic,
+        'BIC': bic,
+        'alpha': fitted['alpha'],
+        'beta': fitted['beta'],
+        'epsilon': fitted['epsilon'],
+        'phi': fitted['phi'],
+        'converged': result.success,
+        'n_iterations': result.nit,
+        'optimization_message': result.message,
+    }
+
+
+def fit_sr_dyna_for_all_users(users_dict: Dict[int, Any],
+                             config: Optional[SRDynaConfig] = None,
+                             sample_size: Optional[int] = None,
+                             verbose: bool = True) -> pd.DataFrame:
+    """Fit SR-Dyna model for all users."""
+    config = config if config is not None else SRDynaConfig()
+
+    user_ids = list(users_dict.keys())
+    if sample_size is not None:
+        user_ids = user_ids[:sample_size]
+
+    results = []
+    for i, user_id in enumerate(user_ids):
+        if verbose:
+            print(f"[{i+1}/{len(user_ids)}] Fitting SR-Dyna for user {user_id}...", end='')
+
+        user = users_dict[user_id]
+        user_df = user.to_dataframe()
+
+        try:
+            result = fit_sr_dyna_model(user_df, config, verbose=False)
+            result['user_id'] = user_id
+            results.append(result)
+            if verbose:
+                print(f"\tLL: {result['log_likelihood']:.2f}")
+        except Exception as e:
+            if verbose:
+                print(f"\tError: {e}")
+            results.append({
+                'user_id': user_id,
+                'n_records': 0,
+                'log_likelihood': np.nan,
+                'AIC': np.nan,
+                'BIC': np.nan,
+                'alpha': np.nan,
+                'beta': np.nan,
+                'epsilon': np.nan,
+                'phi': np.nan,
+                'converged': False,
+                'n_iterations': None,
+                'optimization_message': str(e),
+            })
+
+    return pd.DataFrame(results)
