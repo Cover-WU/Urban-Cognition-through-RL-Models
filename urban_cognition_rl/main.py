@@ -81,11 +81,12 @@ def main():
     df = load_and_preprocess_data()
     users_dict = convert_to_users(df)
 
-    mf_results = run_mf_model(users_dict)
+    # mf_results = run_mf_model(users_dict)
     mfe_results = run_mfe_model(users_dict)
     srdyna_results = run_sr_dyna_model(users_dict)
 
-    return mf_results, mfe_results, srdyna_results
+    # return mf_results, mfe_results, srdyna_results
+    return mfe_results, srdyna_results
 
 
 if __name__ == "__main__":

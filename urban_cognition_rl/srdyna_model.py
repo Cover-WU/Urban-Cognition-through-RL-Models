@@ -10,6 +10,8 @@ from collections import defaultdict
 from itertools import chain
 from scipy.optimize import minimize
 
+import pandas as pd
+
 from .utils import compute_day_sequence, compute_time_angle, compute_reward_array
 
 

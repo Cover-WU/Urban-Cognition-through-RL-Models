@@ -3,6 +3,7 @@ Model-Free with Episodic Memory (MFE) RL estimation.
 """
 
 import numpy as np
+import pandas as pd
 import warnings
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any, Set
