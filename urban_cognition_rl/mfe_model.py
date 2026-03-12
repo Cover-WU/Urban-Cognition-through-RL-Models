@@ -35,7 +35,7 @@ class MFEpiConfig:
 @dataclass
 class QRecord(EntryRecord):
     """One memory trace for a (state, action, time) tuple."""
-    q_value: float
+    q_value: float = 0.0
 
 
 class QMemory(EpisodicMemory):

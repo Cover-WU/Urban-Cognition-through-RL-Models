@@ -39,7 +39,7 @@ class SRDynaConfig:
 @dataclass
 class SRRecord(EntryRecord):
     """A single SR memory record for one (state, action) pair at a specific time."""
-    sr: np.ndarray
+    sr: np.ndarray = None
 
 
 class WorldModel:
