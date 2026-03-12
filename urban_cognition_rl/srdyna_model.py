@@ -61,7 +61,6 @@ class WorldModel:
     def _time_kernel(t1: float, t2: float, sigma: float) -> float:
         """Gaussian kernel for time similarity."""
         diff = abs(float(t1) - float(t2))
-        diff = min(diff, 1.0 - diff)
         return float(np.exp(-0.5 * (diff / sigma) ** 2))
 
     def update(self, state: int, action: int, time_angle: float,
