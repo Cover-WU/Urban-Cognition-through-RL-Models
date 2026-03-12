@@ -11,6 +11,7 @@ from typing import Dict, List, Tuple, Optional, Any, Set
 from collections import defaultdict
 from scipy.optimize import minimize
 
+from .epi_memory import EntryRecord, EpisodicMemory
 from .utils import compute_day_sequence, compute_time_angle, compute_reward_array, compute_time_kernel, prepare_trajectory_data, pack_params, unpack_params
 
 
@@ -30,79 +31,40 @@ class MFEpiConfig:
     ftol: float = 1e-6
 
 
+
 @dataclass
-class EpisodicRecord:
+class QRecord(EntryRecord):
     """One memory trace for a (state, action, time) tuple."""
     q_value: float
-    time_angle: float
-    day_seq: int
-    record_date: int
-    strength: float = 1.0
 
 
-class EpisodicMemory:
-    """Non-parametric episodic memory for Q-value retrieval."""
+class QMemory(EpisodicMemory):
+    """Q-Value episodic memory for MFE model."""
 
     def __init__(self, phi: float, config: Optional[MFEpiConfig] = None):
-        self.config = config if config is not None else MFEpiConfig()
-        self.phi = phi
+        super().__init__(phi, config if config is not None else MFEpiConfig())
 
-        self.Q_table: Dict[int, Dict[int, List[EpisodicRecord]]] = defaultdict(lambda: defaultdict(list))
-        self.Q_decay: Dict[int, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
-        self.node_strength: Dict[int, float] = {}
-        self.node_visits: Dict[int, int] = {}
-        self.last_day: Optional[int] = None
-        self._active_nodes: Optional[Set[int]] = None
+    @property
+    def Q_table(self) -> Dict[int, Dict[int, List[EntryRecord]]]:
+        """Alias for memory field - Q-value table."""
+        return self.memory
+
 
     def add_record(self, node_id: int, action_id: int, time_angle: float, q_value: float,
-                   day_seq: int, record_date: int):
-        rec = EpisodicRecord(
+                  day_seq: int, record_date: int):
+        rec = QRecord(
             q_value=float(q_value),
             time_angle=float(time_angle),
             day_seq=int(day_seq),
             record_date=int(record_date),
             strength=1.0,
         )
+        self._add_record_base(rec, node_id, action_id)
 
-        self.Q_table[node_id][action_id].append(rec)
-        self.Q_decay[node_id][action_id] = 1.0
-        self.node_strength[node_id] = self.node_strength.get(node_id, 0.0) + 1.0
-        self.node_visits[node_id] = self.node_visits.get(node_id, 0) + 1
-        self._active_nodes = None
-
-    def decay(self, current_day: int):
-        if self.last_day is None:
-            self.last_day = current_day
-            return
-
-        day_diff = int(current_day - self.last_day)
-        if day_diff > 0:
-            factor = (1.0 - self.phi) ** day_diff
-
-            for s in self.Q_table:
-                for a in self.Q_table[s]:
-                    for rec in self.Q_table[s][a]:
-                        rec.strength *= factor
-
-            for node_id in self.node_strength:
-                self.node_strength[node_id] *= factor
-                for action_id in self.Q_decay[node_id]:
-                    self.Q_decay[node_id][action_id] *= factor
-
-            self._active_nodes = None
-
-        self.last_day = current_day
-
-    def compute_time_similarity(t1: float, t2: float, sigma_t: float) -> float:
-        """Circular Gaussian kernel on normalized time angle [0, 1)."""
-        return compute_time_kernel(t1, t2, sigma_t)
-
-    def get_records_for_sa_pair(self, node_id: int, action_id: int) -> List[EpisodicRecord]:
-        return self.Q_table[int(node_id)][int(action_id)]
 
     def retrieve_q(self, target_node: int, target_action: int, target_time: float,
-                   sigma_t: Optional[float] = None) -> float:
-        """Return Q-hat(target_node, target_action, target_time); returns 0.0 if no evidence."""
+                 sigma_t: Optional[float] = None) -> float:
+        """Return Q-hat(target_node, target_action, target_time)."""
         sigma = self.config.sigma_t_init if sigma_t is None else float(sigma_t)
         recs = self.get_records_for_sa_pair(target_node, target_action)
         if not recs:
@@ -110,29 +72,19 @@ class EpisodicMemory:
 
         q_values = np.array([rec.q_value for rec in recs], dtype=np.float64)
         strengths = np.array([rec.strength for rec in recs], dtype=np.float64)
-        similarities = np.array([self.compute_time_similarity(target_time, rec.time_angle, sigma) for rec in recs])
+        similarities = np.array([
+            compute_time_kernel(target_time, rec.time_angle, sigma)
+            for rec in recs
+        ])
 
         weights = similarities * strengths
-
         q_estimate = np.average(q_values, weights=weights)
-        q_estimate *= self.Q_decay[target_node][target_action]
+        q_estimate *= self.memory_decay[target_node][target_action]
 
         return q_estimate
 
-    def get_active_nodes(self) -> Set[int]:
-        if self._active_nodes is not None:
-            return self._active_nodes
 
-        self._active_nodes = {
-            node_id
-            for node_id, strength in self.node_strength.items()
-            if strength >= self.config.memory_threshold
-            and self.node_visits.get(node_id, 0) >= self.config.visit_threshold
-        }
-        return self._active_nodes
-
-
-def prepare_data(user_df: pd.DataFrame, config: Optional[MFEpiConfig] = None) -> Dict[str, Any]:
+def prepare_mfe_data(user_df: pd.DataFrame, config: Optional[MFEpiConfig] = None) -> Dict[str, Any]:
     """Prepare trajectory arrays for MF + episodic model."""
     config = config if config is not None else MFEpiConfig()
 
@@ -146,15 +98,6 @@ def prepare_data(user_df: pd.DataFrame, config: Optional[MFEpiConfig] = None) ->
     return data
 
 
-def unpack_params_time_epi(theta: np.ndarray) -> Dict[str, float]:
-    """theta = [log_alpha, log_beta, logit_epsilon, logit_phi, log_sigma_t]."""
-    return unpack_params(theta)
-
-
-def pack_params_time_epi(alpha: float, beta: float,
-                         epsilon: float, phi: float) -> np.ndarray:
-    """Pack parameters for optimization."""
-    return pack_params(alpha, beta, epsilon, phi)
 
 
 def simulate_and_loglik_mfe(theta: np.ndarray,
@@ -163,7 +106,7 @@ def simulate_and_loglik_mfe(theta: np.ndarray,
     """Negative log-likelihood for MF + episodic memory with TD updates."""
     config = config if config is not None else MFEpiConfig()
 
-    params = unpack_params_time_epi(theta)
+    params = unpack_params(theta)
     alpha = params['alpha']
     beta = params['beta']
     epsilon = params['epsilon']
@@ -182,7 +125,7 @@ def simulate_and_loglik_mfe(theta: np.ndarray,
     known_states: Set[int] = {-1, 0}
     known_actions: Set[int] = {-9, -1, 0}
 
-    memory = EpisodicMemory(phi, config)
+    memory = QMemory(phi, config)
     loglik = 0.0
 
     for t in range(n_records):
@@ -253,7 +196,7 @@ def fit_mfe_model(user_df: pd.DataFrame,
     """Fit MF + episodic memory model for one user trajectory."""
     config = config if config is not None else MFEpiConfig()
 
-    episodic_data = prepare_data(user_df, config)
+    episodic_data = prepare_mfe_data(user_df, config)
     n_records = episodic_data['n_records']
 
     if n_records < 2:
@@ -271,7 +214,7 @@ def fit_mfe_model(user_df: pd.DataFrame,
             'optimization_message': 'Insufficient records',
         }
 
-    theta_init = pack_params_time_epi(
+    theta_init = pack_params(
         alpha=np.clip(config.alpha_init, 1e-6, 1.0),
         beta=max(config.beta_init, 1e-6),
         epsilon=np.clip(config.epsilon_init, 1e-4, 1 - 1e-4),
@@ -288,7 +231,7 @@ def fit_mfe_model(user_df: pd.DataFrame,
             options={'maxiter': int(config.maxiter), 'ftol': float(config.ftol), 'disp': False},
         )
 
-    fitted = unpack_params_time_epi(result.x)
+    fitted = unpack_params(result.x)
     log_likelihood = -float(result.fun)
 
     k_params = 4

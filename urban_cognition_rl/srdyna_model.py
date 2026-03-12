@@ -14,6 +14,7 @@ from scipy.optimize import minimize
 import pandas as pd
 
 from .utils import compute_day_sequence, compute_time_angle, compute_reward_array, compute_time_kernel, prepare_trajectory_data, pack_params, unpack_params
+from .epi_memory import EntryRecord, EpisodicMemory
 
 
 @dataclass
@@ -36,13 +37,9 @@ class SRDynaConfig:
 
 
 @dataclass
-class SRRecord:
+class SRRecord(EntryRecord):
     """A single SR memory record for one (state, action) pair at a specific time."""
     sr: np.ndarray
-    time_angle: float
-    day_seq: int
-    record_date: int
-    strength: float = 1.0
 
 
 class WorldModel:
@@ -56,11 +53,6 @@ class WorldModel:
         self.state_visit_times: Dict[int, List[float]] = defaultdict(list)
         self.state_rewards: Dict[int, List[float]] = defaultdict(list)
         self.state_visit_counts: Dict[int, int] = defaultdict(int)
-
-    @staticmethod
-    def _time_kernel(t1: float, t2: float, sigma: float) -> float:
-        """Gaussian kernel for time similarity."""
-        return compute_time_kernel(t1, t2, sigma)
 
     def update(self, state: int, action: int, time_angle: float,
                reward: float, day_continues: bool, next_time_angle: float = None):
@@ -93,7 +85,7 @@ class WorldModel:
         total_weight = 0.0
         weighted_sum = 0.0
         for t, delta in valid_transitions:
-            weight = self._time_kernel(time_angle, t, self.sigma_t)
+            weight = compute_time_kernel(time_angle, t, self.sigma_t)
             total_weight += weight
             weighted_sum += weight * delta
 
@@ -107,19 +99,17 @@ class WorldModel:
         return float(np.mean(self.state_rewards[state]))
 
 
-class SRMemory:
-    """Memory structure for Successor Representation."""
+class SRMemory(EpisodicMemory):
+    """Successor Representation memory, inheriting common methods from EpisodicMemory."""
 
     def __init__(self, phi: float, config: Optional[SRDynaConfig] = None):
-        self.config = config if config is not None else SRDynaConfig()
-        self.phi = phi
-        self.SR: Dict[int, Dict[int, List[SRRecord]]] = defaultdict(lambda: defaultdict(list))
-        self.SR_decay: Dict[int, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
-        self.node_visits: Dict[int, int] = defaultdict(int)
-        self.node_strength: Dict[int, float] = defaultdict(float)
-        self._active_states: Optional[Set[int]] = None
-        self.last_day: Optional[int] = None
+        super().__init__(phi, config if config is not None else SRDynaConfig())
         self.exploration_rewards: List[float] = []
+
+    @property
+    def SRvisit(self) -> Dict[int, Dict[int, List[EntryRecord]]]:
+        """Alias for memory field - SR visit records."""
+        return self.memory
 
     def add_record(self, node_id: int, action_id: int, time_angle: float,
                    sr_array: np.ndarray, day_seq: int, record_date: int,
@@ -132,20 +122,8 @@ class SRMemory:
             record_date=int(record_date),
             strength=float(strength),
         )
-        self.SR[node_id][action_id].append(rec)
-        self.SR_decay[node_id][action_id] = 1.0
-        self.node_strength[node_id] = self.node_strength.get(node_id, 0.0) + 1.0
-        self.node_visits[node_id] = self.node_visits.get(node_id, 0) + 1
-        self._active_states = None
 
-    @staticmethod
-    def compute_time_similarity(t1: float, t2: float, sigma_t: float) -> float:
-        """Circular Gaussian kernel on normalized time angle [0, 1)."""
-        return compute_time_kernel(t1, t2, sigma_t)
-
-    def get_records_for_sa_pair(self, node_id: int, action_id: int) -> List[SRRecord]:
-        """Get all SR records for (node_id, action_id) pair."""
-        return self.SR.get(int(node_id), {}).get(int(action_id), [])
+        self._add_record_base(rec, node_id, action_id)
 
     def add_exploration_reward(self, reward: float):
         """Record a reward obtained from exploration action."""
@@ -157,14 +135,13 @@ class SRMemory:
             return 0.0
         return float(np.mean(self.exploration_rewards))
 
-    def update_records_for_sa_pair(self, node_id: int, action_id: int, new_sr_records: List[SRRecord]):
+    def update_records_for_sa_pair(self, node_id: int, action_id: int, new_records: List[SRRecord]):
         """Update SR records for (node_id, action_id) pair."""
-        # check the same number of records
-        assert len(self.SR[node_id][action_id]) == len(new_sr_records)
-        self.SR[node_id][action_id] = new_sr_records
+        assert len(self.memory[node_id][action_id]) == len(new_records)
+        self.memory[node_id][action_id] = new_records
 
     def retrieve_sr(self, node_id: int, action_id: int, target_time: float,
-                    sigma_t: Optional[float] = None) -> np.ndarray:
+                 sigma_t: Optional[float] = None) -> np.ndarray:
         """Retrieve SR vector for (node_id, action_id) at target time."""
         sigma = self.config.sigma_t_init if sigma_t is None else float(sigma_t)
 
@@ -178,7 +155,7 @@ class SRMemory:
         sr_arrays = np.array([rec.sr for rec in recs], dtype=np.float64)
         strengths = np.array([rec.strength for rec in recs], dtype=np.float64)
         similarities = np.array([
-            self.compute_time_similarity(target_time, rec.time_angle, sigma)
+            compute_time_kernel(target_time, rec.time_angle, sigma)
             for rec in recs
         ])
 
@@ -191,41 +168,8 @@ class SRMemory:
         return sr_estimate
 
     def sr_is_empty(self) -> bool:
-        """Check the validity of SR."""
-        return not any(chain(*[self.SR[s][a] for s in self.SR for a in self.SR[s]]))
-
-    def decay(self, current_day: int):
-        """Apply memory decay when day changes."""
-        if self.last_day is None:
-            self.last_day = current_day
-            return
-
-        day_diff = int(current_day - self.last_day)
-        if day_diff > 0:
-            factor = (1.0 - self.phi) ** day_diff
-            for s in self.SR:
-                for a in self.SR[s]:
-                    for rec in self.SR[s][a]:
-                        rec.strength *= factor
-            for node_id in self.node_strength:
-                self.node_strength[node_id] *= factor
-                for action_id in self.SR_decay[node_id]:
-                    self.SR_decay[node_id][action_id] *= factor
-            self._active_states = None
-
-        self.last_day = current_day
-
-    def get_active_states(self) -> Set[int]:
-        """Get states with memory strength above threshold."""
-        if self._active_states is not None:
-            return self._active_states
-        self._active_states = {
-            state_id
-            for state_id, strength in self.node_strength.items()
-            if strength >= self.config.memory_threshold
-            and self.node_visits.get(state_id, 0) >= self.config.visit_threshold
-        }
-        return self._active_states
+        """Check if SR memory is empty."""
+        return not any(chain(*[self.memory[s][a] for s in self.memory for a in self.memory[s]]))
 
     def sample_random_sa(self) -> Optional[Tuple[int, int]]:
         """Randomly sample a (state, action) pair from memory for planning."""
@@ -233,8 +177,8 @@ class SRMemory:
             return None
 
         valid_pairs = []
-        for s in self.SR:
-            for a in self.SR[s]:
+        for s in self.memory:
+            for a in self.memory[s]:
                 if a > 0:
                     valid_pairs.append((s, a))
 
@@ -297,15 +241,6 @@ def prepare_sr_dyna_data(user_df: pd.DataFrame,
     return data
 
 
-def unpack_params_sr_dyna(theta: np.ndarray) -> Dict[str, float]:
-    """Unpack SR-Dyna parameters from optimization vector."""
-    return unpack_params(theta)
-
-
-def pack_params_sr_dyna(alpha: float, beta: float, epsilon: float, phi: float) -> np.ndarray:
-    """Pack SR-Dyna parameters for optimization."""
-    return pack_params(alpha, beta, epsilon, phi)
-
 
 def simulate_and_loglik_sr_dyna(theta: np.ndarray,
                                 sr_data: Dict[str, Any],
@@ -313,7 +248,7 @@ def simulate_and_loglik_sr_dyna(theta: np.ndarray,
     """Negative log-likelihood for SR-Dyna model."""
     config = config if config is not None else SRDynaConfig()
 
-    params = unpack_params_sr_dyna(theta)
+    params = unpack_params(theta)
     alpha = params['alpha']
     beta = params['beta']
     epsilon = params['epsilon']
@@ -430,7 +365,7 @@ def simulate_and_loglik_sr_dyna(theta: np.ndarray,
                 time_delta = model.predict_next_time(plan_s, plan_a, plan_time)
                 plan_next_time = (plan_time + time_delta) % 1.0
 
-                plan_a_actions = set(memory.SR.get(plan_a, {}).keys())
+                plan_a_actions = set(memory.SRvisit.get(plan_a, {}).keys())
                 plan_a_actions = list(plan_a_actions | {0, -9})
 
                 best_q = -np.inf
@@ -485,7 +420,7 @@ def fit_sr_dyna_model(user_df: pd.DataFrame,
             'optimization_message': 'Insufficient records',
         }
 
-    theta_init = pack_params_sr_dyna(
+    theta_init = pack_params(
         alpha=config.alpha_init,
         beta=config.beta_init,
         epsilon=config.epsilon_init,
@@ -502,7 +437,7 @@ def fit_sr_dyna_model(user_df: pd.DataFrame,
             options={'maxiter': config.maxiter, 'ftol': config.ftol, 'disp': False},
         )
 
-    fitted = unpack_params_sr_dyna(result.x)
+    fitted = unpack_params(result.x)
     log_likelihood = -float(result.fun)
 
     k_params = 4
