@@ -179,44 +179,119 @@ class User:
                 })
         return pd.DataFrame(records)
 
+    @staticmethod
+    def _process_crossing_visits(row: pd.Series) -> List[tuple]:
+        """
+        Split a visit record into segments based on the 3 AM threshold day definition.
+
+        A trajectory day is defined as: from 3:00 AM today to 3:00 AM tomorrow.
+        - Before 3 AM belongs to the previous calendar day (stayed up late)
+        - After 3 AM belongs to the current calendar day
+
+        Returns a list of (Visit, threshold_date_yyyymmdd) tuples.
+        """
+        threshold_hour = User.DAY_THRESHOLD_HOUR
+        result: List[tuple] = []
+
+        t_start = pd.to_datetime(row['t_start'])
+        t_end = pd.to_datetime(row['t_end'])
+
+        visit = Visit(
+            t_start=t_start,
+            t_end=t_end,
+            lon=float(row['lon']),
+            lat=float(row['lat']),
+            cluster_id=int(row.get('cluster_id', -1)) if pd.notna(row.get('cluster_id')) else -1,
+            ptype=int(row['ptype']) if pd.notna(row.get('ptype')) else None,
+            poi=int(row['poi']) if pd.notna(row.get('poi')) else None
+        )
+
+        def get_threshold_date(dt: pd.Timestamp) -> int:
+            if dt.hour >= threshold_hour:
+                threshold_date = dt.date()
+            else:
+                threshold_date = (dt - timedelta(days=1)).date()
+            return int(threshold_date.strftime('%Y%m%d'))
+
+        start_threshold_date = get_threshold_date(t_start)
+        end_threshold_date = get_threshold_date(t_end)
+
+        if start_threshold_date == end_threshold_date:
+            result.append((visit, start_threshold_date))
+            return result
+
+        first_threshold = t_start.replace(hour=threshold_hour, minute=0, second=0, microsecond=0)
+        if t_start >= first_threshold:
+            first_threshold = first_threshold + timedelta(days=1)
+
+        if t_start < first_threshold:
+            visit1 = Visit(
+                t_start=t_start,
+                t_end=first_threshold,
+                lon=visit.lon,
+                lat=visit.lat,
+                cluster_id=visit.cluster_id,
+                ptype=visit.ptype,
+                poi=visit.poi
+            )
+            result.append((visit1, start_threshold_date))
+
+        current_threshold = first_threshold
+        while current_threshold < t_end:
+            next_threshold = current_threshold + timedelta(days=1)
+            if next_threshold > t_end:
+                break
+
+            middle_visit = Visit(
+                t_start=current_threshold,
+                t_end=next_threshold,
+                lon=visit.lon,
+                lat=visit.lat,
+                cluster_id=visit.cluster_id,
+                ptype=visit.ptype,
+                poi=visit.poi
+            )
+            current_threshold_date = get_threshold_date(current_threshold + timedelta(hours=12))
+            result.append((middle_visit, current_threshold_date))
+
+            current_threshold = next_threshold
+
+        if current_threshold < t_end:
+            final_visit = Visit(
+                t_start=current_threshold,
+                t_end=t_end,
+                lon=visit.lon,
+                lat=visit.lat,
+                cluster_id=visit.cluster_id,
+                ptype=visit.ptype,
+                poi=visit.poi
+            )
+            result.append((final_visit, end_threshold_date))
+
+        return result
+
     @classmethod
     def from_dataframe(cls, df: pd.DataFrame) -> Dict[int, 'User']:
         """Create User objects from DataFrame."""
+        df = df.copy()
+        df['t_start'] = pd.to_datetime(df['t_start'])
+        df['t_end'] = pd.to_datetime(df['t_end'])
+
         df = df.sort_values(['who', 't_start']).reset_index(drop=True)
-        users = {}
+        users: Dict[int, User] = {}
 
-        for who, group in df.groupby('who'):
-            user = cls(int(who))
-            current_date = None
-            current_traj = None
+        for _, row in df.iterrows():
+            who = int(row['who'])
+            if who not in users:
+                users[who] = cls(id=who)
 
-            for _, row in group.iterrows():
-                t_start = pd.to_datetime(row['t_start'])
-                t_end = pd.to_datetime(row['t_end'])
+            user = users[who]
+            visits_to_add = cls._process_crossing_visits(row)
 
-                date = int(row['date'])
-
-                if date != current_date:
-                    if current_traj is not None:
-                        user.add_trajectory(current_traj)
-                    current_traj = Trajectory(date=date)
-                    current_date = date
-
-                visit = Visit(
-                    t_start=t_start,
-                    t_end=t_end,
-                    lon=float(row['lon']),
-                    lat=float(row['lat']),
-                    cluster_id=int(row.get('cluster_id', 0)) if pd.notna(row.get('cluster_id')) else 0,
-                    ptype=int(row['ptype']) if pd.notna(row.get('ptype')) else None,
-                    poi=int(row['poi']) if pd.notna(row.get('poi')) else None
-                )
-                current_traj.add_visit(visit)
-
-            if current_traj is not None:
-                user.add_trajectory(current_traj)
-
-            users[int(who)] = user
+            for visit, visit_date in visits_to_add:
+                if visit_date not in user.trajectories:
+                    user.trajectories[visit_date] = Trajectory(date=visit_date)
+                user.trajectories[visit_date].add_visit(visit)
 
         return users
 

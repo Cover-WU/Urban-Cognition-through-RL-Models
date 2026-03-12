@@ -82,8 +82,8 @@ def main():
     users_dict = convert_to_users(df)
 
     # mf_results = run_mf_model(users_dict)
-    mfe_results = run_mfe_model(users_dict)
-    srdyna_results = run_sr_dyna_model(users_dict)
+    mfe_results = run_mfe_model(users_dict, sample_size=10)
+    srdyna_results = run_sr_dyna_model(users_dict, sample_size=10)
 
     # return mf_results, mfe_results, srdyna_results
     return mfe_results, srdyna_results

@@ -4,6 +4,7 @@ Model-Free (MF) RL estimation with TD learning.
 
 import numpy as np
 import pandas as pd
+import time
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -345,16 +346,20 @@ def fit_mf_for_all_users(users_dict: Dict[int, Any],
         user_df = user.to_dataframe()
 
         try:
+            t_start = time.time()
             result = fit_mf_model(user_df, config, verbose=False)
+            elapsed = time.time() - t_start
             result['user_id'] = user_id
+            result['fit_time_seconds'] = elapsed
             results.append(result)
             if verbose:
-                print(f" done (LL: {result['log_likelihood']:.2f})")
+                print(f" done (LL: {result['log_likelihood']:.2f}, time: {elapsed:.2f}s)")
         except Exception as e:
             if verbose:
                 print(f" error: {e}")
             results.append({
                 'user_id': user_id,
+                'fit_time_seconds': np.nan,
                 'n_records': 0,
                 'log_likelihood': np.nan,
                 'AIC': np.nan,

@@ -5,6 +5,7 @@ Model-Free with Episodic Memory (MFE) RL estimation.
 import numpy as np
 import pandas as pd
 import warnings
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any, Set
 from collections import defaultdict
@@ -153,6 +154,12 @@ def prepare_data(user_df: pd.DataFrame, config: Optional[MFEpiConfig] = None) ->
     stay_minutes = np.roll(stay_minutes, -1)
     stay_minutes[-1] = 0.0
 
+    reward_array = compute_reward_array(
+        stay_minutes,
+        config.reward_type,
+        config.reward_param_init,
+    )
+
     actions = np.zeros(n_records, dtype=int)
     actions[-1] = -9
     for t in range(n_records - 1):
@@ -172,6 +179,7 @@ def prepare_data(user_df: pd.DataFrame, config: Optional[MFEpiConfig] = None) ->
         'time_angles': time_angles,
         'date_array': date_array,
         'stay_minutes': stay_minutes,
+        'reward_array': reward_array,
         'same_day_next': same_day_next,
         'n_records': n_records,
     }
@@ -396,16 +404,20 @@ def fit_mfe_for_all_users(users_dict: Dict[int, Any],
         user_df = user.to_dataframe()
 
         try:
+            t_start = time.time()
             result = fit_mfe_model(user_df, config, verbose=False)
+            elapsed = time.time() - t_start
             result['user_id'] = user_id
+            result['fit_time_seconds'] = elapsed
             results.append(result)
             if verbose:
-                print(f"\tLL: {result['log_likelihood']:.2f}")
+                print(f"\tLL: {result['log_likelihood']:.2f}, time: {elapsed:.2f}s")
         except Exception as e:
             if verbose:
                 print(f"\tError: {e}")
             results.append({
                 'user_id': user_id,
+                'fit_time_seconds': np.nan,
                 'n_records': 0,
                 'log_likelihood': np.nan,
                 'AIC': np.nan,
