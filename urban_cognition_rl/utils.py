@@ -4,7 +4,8 @@ Utility functions shared across all models.
 
 import numpy as np
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, Any
+import pandas as pd
 
 
 def compute_day_sequence(date_array: np.ndarray,
@@ -93,6 +94,22 @@ def compute_reward_array(stay_minutes: np.ndarray,
     return np.nan_to_num(rewards, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def compute_time_kernel(t1: float, t2: float, sigma: float) -> float:
+    """
+    Gaussian kernel for time similarity on normalized time angle [0, 1).
+
+    Parameters:
+    - t1, t2: Time angles in [0, 1)
+    - sigma: Kernel bandwidth
+
+    Returns:
+    - Similarity weight in [0, 1]
+    """
+    diff = abs(float(t1) - float(t2))
+    sigma = max(float(sigma), 1e-6)
+    return float(np.exp(-0.5 * (diff / sigma) ** 2))
+
+
 def compute_time_discount_factor(time_angle: float) -> float:
     """
     Compute time discount factor based on time angle.
@@ -112,3 +129,112 @@ def compute_time_discount_factor(time_angle: float) -> float:
     - Time discount factor
     """
     return 1.0 / (1.0 - min(float(time_angle), 0.999))
+
+
+def prepare_trajectory_data(user_df: pd.DataFrame,
+                           config: Any = None,
+                           reward_type: str = 'log',
+                           reward_param_init: float = 1.0) -> Dict[str, Any]:
+    """
+    Prepare trajectory arrays for RL models. Shared by MFE and SR-Dyna.
+
+    Parameters:
+    - user_df: DataFrame with trajectory data
+    - config: Model configuration (optional)
+    - reward_type: Type of reward function
+    - reward_param_init: Reward parameter
+
+    Returns:
+    - Dictionary with states, actions, time_angles, day_seq, etc.
+    """
+    df = user_df.sort_values(by=['t_start']).reset_index(drop=True)
+    n_records = len(df)
+
+    states = df['cluster_id'].astype(int).to_numpy()
+    time_angles = df['t_end'].apply(compute_time_angle).to_numpy(dtype=float)
+    date_array = df['date'].to_numpy()
+
+    date_baseline = int(date_array.min())
+    day_seq = compute_day_sequence(date_array, date_baseline)
+
+    stay_minutes = (df['t_end'] - df['t_start']).dt.total_seconds() / 60.0
+    stay_minutes = stay_minutes.to_numpy(dtype=float)
+    stay_minutes = np.roll(stay_minutes, -1)
+    stay_minutes[-1] = 0.0
+
+    reward_array = compute_reward_array(
+        stay_minutes,
+        reward_type,
+        reward_param_init,
+    )
+
+    actions = np.zeros(n_records, dtype=int)
+    actions[-1] = -9
+    for t in range(n_records - 1):
+        if day_seq[t + 1] > day_seq[t]:
+            actions[t] = -9
+        else:
+            actions[t] = int(states[t + 1])
+
+    same_day_next = np.zeros(n_records, dtype=bool)
+    for t in range(n_records - 1):
+        same_day_next[t] = day_seq[t] == day_seq[t + 1]
+
+    return {
+        'states': states,
+        'actions': actions,
+        'day_seq': day_seq,
+        'time_angles': time_angles,
+        'date_array': date_array,
+        'reward_array': reward_array,
+        'same_day_next': same_day_next,
+        'n_records': n_records,
+    }
+
+
+def pack_params(alpha: float, beta: float, epsilon: float, phi: float) -> np.ndarray:
+    """
+    Pack parameters for optimization (shared by MFE and SR-Dyna).
+
+    Parameters:
+    - alpha: Learning rate
+    - beta: Softmax temperature
+    - epsilon: Exploration rate
+    - phi: Forgetting rate
+
+    Returns:
+    - Parameter vector in logit space
+    """
+    return np.array([
+        np.log(alpha / (1.0 - alpha)),
+        np.log(beta),
+        np.log(epsilon / (1.0 - epsilon)),
+        np.log(phi / (1.0 - phi)),
+    ], dtype=float)
+
+
+def unpack_params(theta: np.ndarray) -> Dict[str, float]:
+    """
+    Unpack parameters from optimization vector (shared by MFE and SR-Dyna).
+
+    Parameters:
+    - theta: Parameter vector in logit space
+
+    Returns:
+    - Dictionary with alpha, beta, epsilon, phi
+    """
+    idx = 0
+    alpha = 1.0 / (1.0 + np.exp(-theta[idx])); idx += 1
+    beta = np.exp(theta[idx]); idx += 1
+    epsilon = 1.0 / (1.0 + np.exp(-theta[idx])); idx += 1
+    phi = 1.0 / (1.0 + np.exp(-theta[idx])); idx += 1
+
+    alpha = float(np.clip(alpha, 1e-6, 1.0))
+    epsilon = float(np.clip(epsilon, 1e-6, 1.0 - 1e-6))
+
+    return {
+        'alpha': alpha,
+        'beta': float(beta),
+        'epsilon': epsilon,
+        'phi': float(phi),
+    }

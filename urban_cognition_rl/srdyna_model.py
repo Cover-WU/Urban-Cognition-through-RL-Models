@@ -13,7 +13,7 @@ from scipy.optimize import minimize
 
 import pandas as pd
 
-from .utils import compute_day_sequence, compute_time_angle, compute_reward_array
+from .utils import compute_day_sequence, compute_time_angle, compute_reward_array, compute_time_kernel, prepare_trajectory_data, pack_params, unpack_params
 
 
 @dataclass
@@ -60,8 +60,7 @@ class WorldModel:
     @staticmethod
     def _time_kernel(t1: float, t2: float, sigma: float) -> float:
         """Gaussian kernel for time similarity."""
-        diff = abs(float(t1) - float(t2))
-        return float(np.exp(-0.5 * (diff / sigma) ** 2))
+        return compute_time_kernel(t1, t2, sigma)
 
     def update(self, state: int, action: int, time_angle: float,
                reward: float, day_continues: bool, next_time_angle: float = None):
@@ -142,9 +141,7 @@ class SRMemory:
     @staticmethod
     def compute_time_similarity(t1: float, t2: float, sigma_t: float) -> float:
         """Circular Gaussian kernel on normalized time angle [0, 1)."""
-        diff = abs(float(t1) - float(t2))
-        sigma = max(float(sigma_t), 1e-6)
-        return float(np.exp(-0.5 * (diff / sigma) ** 2))
+        return compute_time_kernel(t1, t2, sigma_t)
 
     def get_records_for_sa_pair(self, node_id: int, action_id: int) -> List[SRRecord]:
         """Get all SR records for (node_id, action_id) pair."""
@@ -287,83 +284,27 @@ def prepare_sr_dyna_data(user_df: pd.DataFrame,
     """Prepare trajectory data for SR Dyna modeling."""
     config = config if config is not None else SRDynaConfig()
 
-    df = user_df.sort_values('t_start').reset_index(drop=True)
-    n_records = len(df)
-
-    states = df['cluster_id'].astype(int).to_numpy()
-    date_array = df['date'].to_numpy()
-    anchor_size = int(np.max(states)) if len(states) > 0 else 0
-    
-    # Compute time angles
-    time_angles = np.array([compute_time_angle(dt) for dt in df['t_end']])
-    
-    # Compute day sequence
-    date_baseline = int(date_array.min()) if len(date_array) > 0 else None
-    day_seq = compute_day_sequence(date_array, date_baseline)
-
-    stay_minutes = (df['t_end'] - df['t_start']).dt.total_seconds() / 60.0
-    stay_minutes = stay_minutes.to_numpy()
-    stay_minutes = np.roll(stay_minutes, -1)
-    stay_minutes[-1] = 0.0
-
-    reward_array = compute_reward_array(
-        stay_minutes,
+    data = prepare_trajectory_data(
+        user_df,
+        config,
         config.reward_type,
         config.reward_param_init,
     )
 
-    actions = np.zeros(n_records, dtype=int)
-    actions[-1] = -9
-    for t in range(n_records - 1):
-        if day_seq[t + 1] > day_seq[t]:
-            actions[t] = -9
-        else:
-            actions[t] = int(states[t + 1])
+    anchor_size = int(np.max(data['states'])) if len(data['states']) > 0 else 0
+    data['selection_size'] = anchor_size
 
-    same_day_next = np.zeros(n_records, dtype=bool)
-    for t in range(n_records - 1):
-        same_day_next[t] = day_seq[t] == day_seq[t + 1]
-
-    return {
-        'states': states,
-        'actions': actions,
-        'day_seq': day_seq,
-        'time_angles': time_angles,
-        'date_array': date_array,
-        'reward_array': reward_array,
-        'same_day_next': same_day_next,
-        'n_records': n_records,
-        'selection_size': anchor_size,
-    }
+    return data
 
 
 def unpack_params_sr_dyna(theta: np.ndarray) -> Dict[str, float]:
     """Unpack SR-Dyna parameters from optimization vector."""
-    idx = 0
-    alpha = 1.0 / (1.0 + np.exp(-theta[idx])); idx += 1
-    beta = np.exp(theta[idx]); idx += 1
-    epsilon = 1.0 / (1.0 + np.exp(-theta[idx])); idx += 1
-    phi = 1.0 / (1.0 + np.exp(-theta[idx])); idx += 1
-
-    alpha = float(np.clip(alpha, 1e-6, 1.0 - 1e-6))
-    epsilon = float(np.clip(epsilon, 1e-6, 1.0 - 1e-6))
-
-    return {
-        'alpha': alpha,
-        'beta': float(beta),
-        'epsilon': epsilon,
-        'phi': float(phi),
-    }
+    return unpack_params(theta)
 
 
 def pack_params_sr_dyna(alpha: float, beta: float, epsilon: float, phi: float) -> np.ndarray:
     """Pack SR-Dyna parameters for optimization."""
-    return np.array([
-        np.log(alpha / (1.0 - alpha)),
-        np.log(beta),
-        np.log(epsilon / (1.0 - epsilon)),
-        np.log(phi / (1.0 - phi)),
-    ], dtype=np.float64)
+    return pack_params(alpha, beta, epsilon, phi)
 
 
 def simulate_and_loglik_sr_dyna(theta: np.ndarray,

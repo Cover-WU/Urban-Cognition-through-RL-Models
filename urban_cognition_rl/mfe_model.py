@@ -11,7 +11,7 @@ from typing import Dict, List, Tuple, Optional, Any, Set
 from collections import defaultdict
 from scipy.optimize import minimize
 
-from .utils import compute_day_sequence, compute_time_angle, compute_reward_array
+from .utils import compute_day_sequence, compute_time_angle, compute_reward_array, compute_time_kernel, prepare_trajectory_data, pack_params, unpack_params
 
 
 @dataclass
@@ -93,12 +93,9 @@ class EpisodicMemory:
 
         self.last_day = current_day
 
-    @staticmethod
     def compute_time_similarity(t1: float, t2: float, sigma_t: float) -> float:
         """Circular Gaussian kernel on normalized time angle [0, 1)."""
-        diff = abs(float(t1) - float(t2))
-        sigma = max(float(sigma_t), 1e-6)
-        return float(np.exp(-0.5 * (diff / sigma) ** 2))
+        return compute_time_kernel(t1, t2, sigma_t)
 
     def get_records_for_sa_pair(self, node_id: int, action_id: int) -> List[EpisodicRecord]:
         return self.Q_table[int(node_id)][int(action_id)]
@@ -139,80 +136,25 @@ def prepare_data(user_df: pd.DataFrame, config: Optional[MFEpiConfig] = None) ->
     """Prepare trajectory arrays for MF + episodic model."""
     config = config if config is not None else MFEpiConfig()
 
-    df = user_df.sort_values(by=['t_start']).reset_index(drop=True)
-    n_records = len(df)
-
-    states = df['cluster_id'].astype(int).to_numpy()
-    time_angles = df['t_end'].apply(compute_time_angle).to_numpy(dtype=float)
-    date_array = df['date'].to_numpy()
-
-    date_baseline = int(date_array.min())
-    day_seq = compute_day_sequence(date_array, date_baseline)
-
-    stay_minutes = (df['t_end'] - df['t_start']).dt.total_seconds() / 60.0
-    stay_minutes = stay_minutes.to_numpy(dtype=float)
-    stay_minutes = np.roll(stay_minutes, -1)
-    stay_minutes[-1] = 0.0
-
-    reward_array = compute_reward_array(
-        stay_minutes,
+    data = prepare_trajectory_data(
+        user_df,
+        config,
         config.reward_type,
         config.reward_param_init,
     )
 
-    actions = np.zeros(n_records, dtype=int)
-    actions[-1] = -9
-    for t in range(n_records - 1):
-        if day_seq[t + 1] > day_seq[t]:
-            actions[t] = -9
-        else:
-            actions[t] = int(states[t + 1])
-
-    same_day_next = np.zeros(n_records, dtype=bool)
-    for t in range(n_records - 1):
-        same_day_next[t] = day_seq[t] == day_seq[t + 1]
-
-    return {
-        'states': states,
-        'actions': actions,
-        'day_seq': day_seq,
-        'time_angles': time_angles,
-        'date_array': date_array,
-        'reward_array': reward_array,
-        'same_day_next': same_day_next,
-        'n_records': n_records,
-    }
+    return data
 
 
 def unpack_params_time_epi(theta: np.ndarray) -> Dict[str, float]:
     """theta = [log_alpha, log_beta, logit_epsilon, logit_phi, log_sigma_t]."""
-    idx = 0
-
-    alpha = 1.0 / (1.0 + np.exp(-theta[idx])); idx += 1
-    beta = np.exp(theta[idx]); idx += 1
-    epsilon = 1.0 / (1.0 + np.exp(-theta[idx])); idx += 1
-    phi = 1.0 / (1.0 + np.exp(-theta[idx])); idx += 1
-
-    alpha = float(np.clip(alpha, 1e-6, 1.0))
-    epsilon = float(np.clip(epsilon, 1e-6, 1.0 - 1e-6))
-
-    return {
-        'alpha': alpha,
-        'beta': float(beta),
-        'epsilon': epsilon,
-        'phi': float(phi),
-    }
+    return unpack_params(theta)
 
 
 def pack_params_time_epi(alpha: float, beta: float,
                          epsilon: float, phi: float) -> np.ndarray:
     """Pack parameters for optimization."""
-    return np.array([
-        np.log(alpha / (1.0 - alpha)),
-        np.log(beta),
-        np.log(epsilon / (1.0 - epsilon)),
-        np.log(phi / (1.0 - phi)),
-    ], dtype=float)
+    return pack_params(alpha, beta, epsilon, phi)
 
 
 def simulate_and_loglik_mfe(theta: np.ndarray,
