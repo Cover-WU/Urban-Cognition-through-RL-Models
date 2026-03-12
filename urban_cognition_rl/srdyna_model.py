@@ -161,6 +161,12 @@ class SRMemory:
             return 0.0
         return float(np.mean(self.exploration_rewards))
 
+    def update_records_for_sa_pair(self, node_id: int, action_id: int, new_sr_records: List[SRRecord]):
+        """Update SR records for (node_id, action_id) pair."""
+        # check the same number of records
+        assert len(self.SR[node_id][action_id]) == len(new_sr_records)
+        self.SR[node_id][action_id] = new_sr_records
+
     def retrieve_sr(self, node_id: int, action_id: int, target_time: float,
                     sigma_t: Optional[float] = None) -> np.ndarray:
         """Retrieve SR vector for (node_id, action_id) at target time."""
@@ -253,7 +259,7 @@ class SRMemory:
 
 def visited_onehot(action: int, current_state: int, selection_size: int) -> np.ndarray:
     """Create one-hot encoding for visited state."""
-    idx = 0 if action == 0 else (int(action) if action > 0 else selection_size + 1)
+    idx = action if action != -9 else current_state
     return np.eye(selection_size + 2)[idx]
 
 
@@ -288,12 +294,12 @@ def prepare_sr_dyna_data(user_df: pd.DataFrame,
     states = df['cluster_id'].astype(int).to_numpy()
     date_array = df['date'].to_numpy()
     anchor_size = int(np.max(states)) if len(states) > 0 else 0
-
-    time_angles = np.zeros(n_records)
-    for i, t_end in enumerate(df['t_end']):
-        time_angles[i] = compute_time_angle(t_end)
-
-    date_baseline = int(date_array.min())
+    
+    # Compute time angles
+    time_angles = np.array([compute_time_angle(dt) for dt in df['t_end']])
+    
+    # Compute day sequence
+    date_baseline = int(date_array.min()) if len(date_array) > 0 else None
     day_seq = compute_day_sequence(date_array, date_baseline)
 
     stay_minutes = (df['t_end'] - df['t_start']).dt.total_seconds() / 60.0
@@ -325,7 +331,6 @@ def prepare_sr_dyna_data(user_df: pd.DataFrame,
         'day_seq': day_seq,
         'time_angles': time_angles,
         'date_array': date_array,
-        'stay_minutes': stay_minutes,
         'reward_array': reward_array,
         'same_day_next': same_day_next,
         'n_records': n_records,
@@ -341,7 +346,7 @@ def unpack_params_sr_dyna(theta: np.ndarray) -> Dict[str, float]:
     epsilon = 1.0 / (1.0 + np.exp(-theta[idx])); idx += 1
     phi = 1.0 / (1.0 + np.exp(-theta[idx])); idx += 1
 
-    alpha = float(np.clip(alpha, 1e-6, 1.0))
+    alpha = float(np.clip(alpha, 1e-6, 1.0 - 1e-6))
     epsilon = float(np.clip(epsilon, 1e-6, 1.0 - 1e-6))
 
     return {
@@ -376,19 +381,15 @@ def simulate_and_loglik_sr_dyna(theta: np.ndarray,
 
     states = sr_data['states']
     actions = sr_data['actions']
-    day_seq = sr_data['day_seq']
     time_angles = sr_data['time_angles']
+    day_seq = sr_data['day_seq']
     date_array = sr_data['date_array']
     same_day_next = sr_data['same_day_next']
     n_records = sr_data['n_records']
+    reward_array = sr_data['reward_array']
+
     selection_size = sr_data['selection_size']
     config.selection_size = selection_size
-
-    reward_array = compute_reward_array(
-        sr_data['stay_minutes'],
-        config.reward_type,
-        config.reward_param_init,
-    )
 
     visit_counts: Dict[int, int] = defaultdict(int)
     known_states: Set[int] = {-1, 0}
@@ -419,44 +420,48 @@ def simulate_and_loglik_sr_dyna(theta: np.ndarray,
         a_perc = a if a in known_actions else -1
 
         evaluated_actions = sorted([act for act in known_actions if act != -1])
+        
+        q_values = np.array([
+            compute_Q(s_perc, act, time_angle, memory, model, config.sigma_t_init)
+            for act in evaluated_actions
+        ], dtype=float)
 
-        if len(evaluated_actions) == 0:
-            action_prob = np.clip(epsilon, 1e-12, 1.0)
+
+        beta_q = beta * q_values
+        beta_q -= np.max(beta_q)
+        softmax = np.exp(beta_q)
+        softmax /= (np.sum(softmax) + 1e-12)
+
+        probs = (1.0 - epsilon) * softmax
+
+        if a_perc in evaluated_actions:
+            idx_a = evaluated_actions.index(a_perc)
+            action_prob = float(np.clip(probs[idx_a], 1e-12, 1.0))
         else:
-            q_values = np.array([
-                compute_Q(s_perc, act, time_angle, memory, model, config.sigma_t_init)
-                for act in evaluated_actions
-            ], dtype=float)
-
-            beta_q = beta * q_values
-            beta_q -= np.max(beta_q)
-            softmax = np.exp(beta_q)
-            softmax /= (np.sum(softmax) + 1e-12)
-
-            probs = (1.0 - epsilon) * softmax
-
-            if a_perc in evaluated_actions:
-                idx_a = evaluated_actions.index(a_perc)
-                action_prob = float(np.clip(probs[idx_a], 1e-12, 1.0))
-            else:
-                action_prob = float(np.clip(epsilon, 1e-12, 1.0))
+            action_prob = float(np.clip(epsilon, 1e-12, 1.0))
 
         loglik += np.log(action_prob)
 
-        # Update world model
-        day_continues = t < n_records - 1 and same_day_next[t]
-        next_time_angle = float(time_angles[t + 1]) if day_continues else None
-
-        if a_perc != -1:
-            model.update(s_perc, a_perc, time_angle, r_t, day_continues, next_time_angle)
+        # ========================
+        # REAL EXPERIENCE UPDATE
+        # ========================
+        day_continues = same_day_next[t] and t < n_records - 1
+        # Get next time angle for model update
+        if day_continues:
+            time_angle_next = float(time_angles[t + 1])
         else:
+            time_angle_next = None
+        # Update world model with observed transition
+        model.update(s_perc, a_perc, time_angle, r_t, day_continues, time_angle_next)
+        
+        # Record exploration reward if action was exploration (a_perc == -1)
+        if a_perc == -1:
             memory.add_exploration_reward(r_t)
-
-        # TD update for SR
-        if t < n_records - 1 and same_day_next[t]:
+        
+        # Update SR from real transition
+        if day_continues and a_perc >= 0:
             a_next = int(actions[t + 1])
             a_next_perc = a_next if a_next in known_actions else -1
-            time_angle_next = float(time_angles[t + 1])
 
             next_sr = memory.retrieve_sr(a_perc, a_next_perc, time_angle_next, config.sigma_t_init)
             current_sr = memory.retrieve_sr(s_perc, a_perc, time_angle, config.sigma_t_init)
@@ -482,8 +487,8 @@ def simulate_and_loglik_sr_dyna(theta: np.ndarray,
             new_sr_records = []
             for rec in plan_records:
                 plan_time = rec.time_angle
-                plan_next_time_delta = model.predict_next_time(plan_s, plan_a, plan_time)
-                plan_next_time = plan_time + plan_next_time_delta
+                time_delta = model.predict_next_time(plan_s, plan_a, plan_time)
+                plan_next_time = (plan_time + time_delta) % 1.0
 
                 plan_a_actions = set(memory.SR.get(plan_a, {}).keys())
                 plan_a_actions = list(plan_a_actions | {0, -9})
@@ -564,19 +569,29 @@ def fit_sr_dyna_model(user_df: pd.DataFrame,
     aic = 2 * k_params - 2 * log_likelihood
     bic = k_params * np.log(max(n_records, 1)) - 2 * log_likelihood
 
-    return {
+    summary = {
         'n_records': int(n_records),
-        'log_likelihood': log_likelihood,
-        'AIC': aic,
-        'BIC': bic,
-        'alpha': fitted['alpha'],
-        'beta': fitted['beta'],
-        'epsilon': fitted['epsilon'],
-        'phi': fitted['phi'],
-        'converged': result.success,
-        'n_iterations': result.nit,
-        'optimization_message': result.message,
+        'log_likelihood': float(log_likelihood),
+        'AIC': float(aic),
+        'BIC': float(bic),
+        'alpha': float(fitted['alpha']),
+        'beta': float(fitted['beta']),
+        'epsilon': float(fitted['epsilon']),
+        'phi': float(fitted['phi']),
+        'converged': bool(result.success),
+        'n_iterations': int(result.nit) if hasattr(result, 'nit') else 0,
+        'optimization_message': str(result.message) if hasattr(result, 'message') else '',
     }
+
+    if verbose:
+        print(f"SR Dyna model fitting {'converged' if result.success else 'did not converge'}.")
+        print(f"  Log-likelihood: {log_likelihood:.2f}, AIC: {aic:.2f}, BIC: {bic:.2f}")
+        print(f"  alpha (SR rate): {fitted['alpha']:.4f}")
+        print(f"  beta (softmax temp): {fitted['beta']:.4f}")
+        print(f"  epsilon (explore): {fitted['epsilon']:.4f}")
+        print(f"  phi (forgetting): {fitted['phi']:.4f}")
+    
+    return summary
 
 
 def fit_sr_dyna_for_all_users(users_dict: Dict[int, Any],

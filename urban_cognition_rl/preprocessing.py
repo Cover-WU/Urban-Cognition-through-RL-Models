@@ -124,8 +124,10 @@ def preprocess_stay_data(st_data: pd.DataFrame) -> pd.DataFrame:
         ptype=st_data['ptype'].astype(int),
         poi=st_data['poi'].astype(int)
     )
+    st_sample = st_sample[['who', 'date', 't_start', 't_end', 'lon', 'lat', 'ptype', 'poi']].\
+        sort_values(by=['who', 'date', 't_start'])
 
-    return st_sample[['who', 'date', 't_start', 't_end', 'lon', 'lat', 'ptype', 'poi']]
+    return st_sample
 
 
 def process_stay_pipeline(st_sample: pd.DataFrame) -> pd.DataFrame:

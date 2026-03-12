@@ -29,7 +29,7 @@ def add_jitter_and_cluster(
     df: pd.DataFrame,
     jitter_radius_m: float = 300,
     min_cluster_size: int = 6,
-    min_samples: int = 6,
+    min_samples: int = 10,
     seed: int = 114514
 ) -> pd.DataFrame:
     """

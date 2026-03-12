@@ -178,7 +178,6 @@ def prepare_data(user_df: pd.DataFrame, config: Optional[MFEpiConfig] = None) ->
         'day_seq': day_seq,
         'time_angles': time_angles,
         'date_array': date_array,
-        'stay_minutes': stay_minutes,
         'reward_array': reward_array,
         'same_day_next': same_day_next,
         'n_records': n_records,
@@ -235,12 +234,7 @@ def simulate_and_loglik_mfe(theta: np.ndarray,
     date_array = mfe_data['date_array']
     same_day_next = mfe_data['same_day_next']
     n_records = mfe_data['n_records']
-
-    reward_array = compute_reward_array(
-        mfe_data['stay_minutes'],
-        config.reward_type,
-        config.reward_param_init,
-    )
+    reward_array = mfe_data['reward_array']
 
     visit_counts: Dict[int, int] = defaultdict(int)
     known_states: Set[int] = {-1, 0}
