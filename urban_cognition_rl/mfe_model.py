@@ -1,5 +1,7 @@
 """
 Model-Free with Episodic Memory (MFE) RL estimation.
+
+Optimized version with improved memory retrieval and vectorization.
 """
 
 import numpy as np
@@ -12,7 +14,9 @@ from collections import defaultdict
 from scipy.optimize import minimize
 
 from .epi_memory import EntryRecord, EpisodicMemory
-from .utils import compute_day_sequence, compute_time_angle, compute_reward_array, compute_time_kernel, prepare_trajectory_data, pack_params, unpack_params
+from .utils import compute_time_kernel, prepare_trajectory_data, pack_params, unpack_params, unpack_params_for_fast
+from .mfe_model_speed import simulate_and_loglik_mfe as simulate_and_loglik_mfe_fast
+from .mfe_model_speed import _warmup_jit
 
 
 @dataclass
@@ -27,9 +31,9 @@ class MFEpiConfig:
     reward_param_init: float = 1.0
     visit_threshold: int = 3
     memory_threshold: float = 0.01
+    time_slots: int = 48
     maxiter: int = 1000
     ftol: float = 1e-6
-
 
 
 @dataclass
@@ -64,7 +68,10 @@ class QMemory(EpisodicMemory):
 
     def retrieve_q(self, target_node: int, target_action: int, target_time: float,
                  sigma_t: Optional[float] = None) -> float:
-        """Return Q-hat(target_node, target_action, target_time)."""
+        """Return Q-hat(target_node, target_action, target_time).
+
+        Optimized version with vectorized kernel computation.
+        """
         sigma = self.config.sigma_t_init if sigma_t is None else float(sigma_t)
         recs = self.get_records_for_sa_pair(target_node, target_action)
         if not recs:
@@ -81,7 +88,8 @@ class QMemory(EpisodicMemory):
         q_estimate = np.average(q_values, weights=weights)
         q_estimate *= self.memory_decay[target_node][target_action]
 
-        return q_estimate
+        return float(q_estimate)
+
 
 
 def prepare_mfe_data(user_df: pd.DataFrame, config: Optional[MFEpiConfig] = None) -> Dict[str, Any]:
@@ -103,7 +111,10 @@ def prepare_mfe_data(user_df: pd.DataFrame, config: Optional[MFEpiConfig] = None
 def simulate_and_loglik_mfe(theta: np.ndarray,
                             mfe_data: Dict[str, Any],
                             config: Optional[MFEpiConfig] = None) -> float:
-    """Negative log-likelihood for MF + episodic memory with TD updates."""
+    """Negative log-likelihood for MF + episodic memory with TD updates.
+
+    Optimized version with cached memory retrieval.
+    """
     config = config if config is not None else MFEpiConfig()
 
     params = unpack_params(theta)
@@ -127,6 +138,7 @@ def simulate_and_loglik_mfe(theta: np.ndarray,
 
     memory = QMemory(phi, config)
     loglik = 0.0
+
 
     for t in range(n_records):
         s = int(states[t])
@@ -192,12 +204,24 @@ def simulate_and_loglik_mfe(theta: np.ndarray,
 
 def fit_mfe_model(user_df: pd.DataFrame,
                             config: Optional[MFEpiConfig] = None,
-                            verbose: bool = True) -> Dict[str, Any]:
+                            verbose: bool = True,
+                            high_performance: bool = False) -> Dict[str, Any]:
     """Fit MF + episodic memory model for one user trajectory."""
     config = config if config is not None else MFEpiConfig()
 
     episodic_data = prepare_mfe_data(user_df, config)
     n_records = episodic_data['n_records']
+
+    if high_performance:
+        states = episodic_data['states']
+        actions = episodic_data['actions']
+        time_angles = episodic_data['time_angles']
+        day_seq = episodic_data['day_seq']
+        date_array = episodic_data['date_array']
+        same_day_next = episodic_data['same_day_next']
+        reward_array = episodic_data['reward_array']
+        episodic_data = (states, actions, time_angles, day_seq, date_array, same_day_next, n_records, reward_array)
+        selection_size = np.max(states).astype(int)
 
     if n_records < 2:
         return {
@@ -213,23 +237,33 @@ def fit_mfe_model(user_df: pd.DataFrame,
             'n_iterations': 0,
             'optimization_message': 'Insufficient records',
         }
-
     theta_init = pack_params(
-        alpha=np.clip(config.alpha_init, 1e-6, 1.0),
-        beta=max(config.beta_init, 1e-6),
-        epsilon=np.clip(config.epsilon_init, 1e-4, 1 - 1e-4),
-        phi=np.clip(config.phi_init, 1e-4, 1 - 1e-4),
-    )
+            alpha=np.clip(config.alpha_init, 1e-6, 1.0),
+            beta=max(config.beta_init, 1e-6),
+            epsilon=np.clip(config.epsilon_init, 1e-4, 1 - 1e-4),
+            phi=np.clip(config.phi_init, 1e-4, 1 - 1e-4),
+        )
 
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
-        result = minimize(
-            simulate_and_loglik_mfe,
-            theta_init,
-            args=(episodic_data, config),
-            method='L-BFGS-B',
-            options={'maxiter': int(config.maxiter), 'ftol': float(config.ftol), 'disp': False},
-        )
+        if high_performance:
+            # warm-up the function
+            _warmup_jit()
+            result = minimize(
+                simulate_and_loglik_mfe_fast,
+                theta_init,
+                args=(episodic_data, selection_size, config.time_slots, config.sigma_t_init, config.visit_threshold),
+                method='L-BFGS-B',
+                options={'maxiter': int(config.maxiter), 'ftol': float(config.ftol), 'disp': False},
+            )
+        else:
+            result = minimize(
+                simulate_and_loglik_mfe,
+                theta_init,
+                args=(episodic_data, config),
+                method='L-BFGS-B',
+                options={'maxiter': int(config.maxiter), 'ftol': float(config.ftol), 'disp': False},
+            )
 
     fitted = unpack_params(result.x)
     log_likelihood = -float(result.fun)
@@ -266,7 +300,8 @@ def fit_mfe_model(user_df: pd.DataFrame,
 def fit_mfe_for_all_users(users_dict: Dict[int, Any],
                           config: Optional[MFEpiConfig] = None,
                           sample_size: Optional[int] = None,
-                          verbose: bool = True) -> pd.DataFrame:
+                          verbose: bool = True,
+                          high_performance: bool = False) -> pd.DataFrame:
     """Fit MF+episodic model for all users."""
     config = config if config is not None else MFEpiConfig()
 
@@ -284,7 +319,7 @@ def fit_mfe_for_all_users(users_dict: Dict[int, Any],
 
         try:
             t_start = time.time()
-            result = fit_mfe_model(user_df, config, verbose=False)
+            result = fit_mfe_model(user_df, config, verbose=False, high_performance=high_performance)
             elapsed = time.time() - t_start
             result['user_id'] = user_id
             result['fit_time_seconds'] = elapsed

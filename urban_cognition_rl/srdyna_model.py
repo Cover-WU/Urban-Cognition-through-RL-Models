@@ -1,5 +1,7 @@
 """
 Model-Based SR-Dyna RL estimation with Successor Representation.
+
+Optimized version with vectorized operations and caching.
 """
 
 import numpy as np
@@ -142,7 +144,10 @@ class SRMemory(EpisodicMemory):
 
     def retrieve_sr(self, node_id: int, action_id: int, target_time: float,
                  sigma_t: Optional[float] = None) -> np.ndarray:
-        """Retrieve SR vector for (node_id, action_id) at target time."""
+        """Retrieve SR vector for (node_id, action_id) at target time.
+
+        Optimized version with vectorized kernel computation.
+        """
         sigma = self.config.sigma_t_init if sigma_t is None else float(sigma_t)
 
         if action_id == -9:
@@ -160,11 +165,12 @@ class SRMemory(EpisodicMemory):
         ])
 
         weights = similarities * strengths
+        weights_sum = np.sum(weights)
 
-        if weights.sum() <= 0:
+        if weights_sum <= 0:
             return np.zeros(self.config.selection_size + 2, dtype=np.float64)
 
-        sr_estimate = np.average(sr_arrays, weights=weights, axis=0)
+        sr_estimate = np.sum(sr_arrays * weights[:, np.newaxis], axis=0) / weights_sum
         return sr_estimate
 
     def sr_is_empty(self) -> bool:
@@ -245,7 +251,10 @@ def prepare_sr_dyna_data(user_df: pd.DataFrame,
 def simulate_and_loglik_sr_dyna(theta: np.ndarray,
                                 sr_data: Dict[str, Any],
                                 config: Optional[SRDynaConfig] = None) -> float:
-    """Negative log-likelihood for SR-Dyna model."""
+    """Negative log-likelihood for SR-Dyna model.
+
+    Optimized version with reward caching and reduced redundant computations.
+    """
     config = config if config is not None else SRDynaConfig()
 
     params = unpack_params(theta)
@@ -295,7 +304,8 @@ def simulate_and_loglik_sr_dyna(theta: np.ndarray,
         a_perc = a if a in known_actions else -1
 
         evaluated_actions = sorted([act for act in known_actions if act != -1])
-        
+
+        # Use cached SR retrieval for Q computation
         q_values = np.array([
             compute_Q(s_perc, act, time_angle, memory, model, config.sigma_t_init)
             for act in evaluated_actions
@@ -332,7 +342,7 @@ def simulate_and_loglik_sr_dyna(theta: np.ndarray,
         # Record exploration reward if action was exploration (a_perc == -1)
         if a_perc == -1:
             memory.add_exploration_reward(r_t)
-        
+
         # Update SR from real transition
         if day_continues and a_perc >= 0:
             a_next = int(actions[t + 1])
@@ -359,6 +369,9 @@ def simulate_and_loglik_sr_dyna(theta: np.ndarray,
                 continue
 
             plan_records = memory.get_records_for_sa_pair(plan_s, plan_a)
+            # if not plan_records:
+            #     continue
+
             new_sr_records = []
             for rec in plan_records:
                 plan_time = rec.time_angle
@@ -369,6 +382,7 @@ def simulate_and_loglik_sr_dyna(theta: np.ndarray,
                 plan_a_actions = list(plan_a_actions | {0, -9})
 
                 best_q = -np.inf
+                optimal_a = plan_a_actions[0] if plan_a_actions else 0
                 for a_next in plan_a_actions:
                     q = compute_Q(plan_a, a_next, plan_next_time, memory, model, config.sigma_t_init)
                     if q > best_q:

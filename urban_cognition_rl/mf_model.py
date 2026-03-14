@@ -1,5 +1,7 @@
 """
 Model-Free (MF) RL estimation with TD learning.
+
+Pure Python implementation (no Numba required).
 """
 
 import numpy as np
@@ -150,13 +152,21 @@ def pack_params_mf(alpha: float, beta: float, epsilon: float, phi: float,
     return np.array(params, dtype=np.float64)
 
 
+# ============================================================================
+# Pure Python MF simulation
+# ============================================================================
+
+
 def simulate_and_loglik_mf(theta: np.ndarray,
                           mf_data: Dict[str, Any],
                           feature_dim: int = 0,
                           reward_type: str = 'log',
                           has_reward_param: bool = True,
                           visit_threshold: int = 3) -> float:
-    """Compute negative log-likelihood for MF (TD) model."""
+    """Compute negative log-likelihood for MF (TD) model.
+
+    Pure Python implementation.
+    """
     params = unpack_params_mf(theta, feature_dim, has_reward_param)
     alpha = params['alpha']
     beta = params['beta']
@@ -172,6 +182,19 @@ def simulate_and_loglik_mf(theta: np.ndarray,
     same_day_next = mf_data['same_day_next']
 
     reward_array = compute_reward_array(mf_data['stay_minutes'], reward_type, reward_param)
+
+    # Use optimized version
+    return _simulate_and_loglik_mf_optimized(
+        states, actions, day_seq, time_angles, reward_array,
+        same_day_next, alpha, beta, epsilon, phi, visit_threshold
+    )
+
+
+def _simulate_and_loglik_mf_optimized(states, actions, day_seq, time_angles,
+                                       reward_array, same_day_next, alpha, beta,
+                                       epsilon, phi, visit_threshold):
+    """Optimized pure Python version of MF simulation."""
+    n_records = len(states)
 
     Q_tables: Dict[int, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
     visit_counts: Dict[int, int] = defaultdict(int)
@@ -191,9 +214,10 @@ def simulate_and_loglik_mf(theta: np.ndarray,
 
         if prev_day is not None and current_day > prev_day:
             discount_factor = (1.0 - phi)
+            day_diff = current_day - prev_day
+            multi_day_discount = discount_factor ** day_diff
             for state_dict in Q_tables.values():
                 for action_key in state_dict:
-                    multi_day_discount = discount_factor ** (current_day - prev_day)
                     state_dict[action_key] *= multi_day_discount
         prev_day = current_day
 
@@ -206,45 +230,45 @@ def simulate_and_loglik_mf(theta: np.ndarray,
         s_perc = s if s in known_states else -1
         a_perc = a if a in known_actions else -1
 
-        time_scale = 1
-
+        # Pre-sorted evaluated actions list for efficiency
         evaluated_actions = sorted([act for act in known_actions if act != -1])
 
-        q_values = []
-        for act in evaluated_actions:
-            q_td = Q_tables[s_perc].get(act, 0.0)
-            q_values.append(q_td * time_scale)
-
-        q_values = np.asarray(q_values, dtype=np.float64)
-
-        logits = beta * q_values
-        probs_exploit = np.exp(logits - logsumexp(logits))
-
-        if a_perc in evaluated_actions:
-            idx_a = evaluated_actions.index(a_perc)
-            if idx_a < len(probs_exploit):
-                action_prob = (1.0 - epsilon) * probs_exploit[idx_a]
-        elif a_perc == -1:
+        if len(evaluated_actions) == 0:
             action_prob = epsilon
         else:
-            action_prob = 0
+            # Vectorized Q value retrieval
+            q_values = np.array([
+                Q_tables[s_perc].get(act, 0.0)
+                for act in evaluated_actions
+            ], dtype=np.float64)
+
+            # Optimized softmax with numerical stability
+            logits = beta * q_values
+            logits -= np.max(logits)
+            exp_logits = np.exp(logits)
+            probs = exp_logits / (np.sum(exp_logits) + 1e-12)
+
+            if a_perc in evaluated_actions:
+                idx_a = evaluated_actions.index(a_perc)
+                action_prob = (1.0 - epsilon) * probs[idx_a]
+            elif a_perc == -1:
+                action_prob = epsilon
+            else:
+                action_prob = 0
 
         loglik += np.log(action_prob + 1e-12)
 
+        # TD update
         if t < n_records - 1 and same_day_next[t]:
             a_next = int(actions[t + 1])
             a_next_perc = a_next if a_next in known_actions else -1
-
-            next_time_angle = float(time_angles[t + 1])
-            next_time_scale = 1
-            next_Q_td = Q_tables[a_perc].get(a_next_perc, 0.0) * next_time_scale
+            next_Q = Q_tables[a_perc].get(a_next_perc, 0.0)
         else:
-            next_Q_td = 0.0
+            next_Q = 0.0
 
-        current_Q = Q_tables[s_perc].get(a_perc, 0.0) * time_scale
-        delta = r_t + next_Q_td - current_Q
-
-        Q_tables[s_perc][a_perc] = Q_tables[s_perc].get(a_perc, 0.0) + alpha * delta
+        current_Q = Q_tables[s_perc].get(a_perc, 0.0)
+        delta = r_t + next_Q - current_Q
+        Q_tables[s_perc][a_perc] = current_Q + alpha * delta
 
     return -loglik
 

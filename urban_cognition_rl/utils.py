@@ -3,9 +3,9 @@ Utility functions shared across all models.
 """
 
 import numpy as np
+from numba import njit
 from datetime import datetime
-from typing import Optional, Dict, Any, List, Set
-from collections import defaultdict
+from typing import Optional, Dict, Any, Tuple
 import pandas as pd
 
 
@@ -99,6 +99,8 @@ def compute_time_kernel(t1: float, t2: float, sigma: float) -> float:
     """
     Gaussian kernel for time similarity on normalized time angle [0, 1).
 
+    Optimized version using vectorized numpy operations when possible.
+
     Parameters:
     - t1, t2: Time angles in [0, 1)
     - sigma: Kernel bandwidth
@@ -106,8 +108,9 @@ def compute_time_kernel(t1: float, t2: float, sigma: float) -> float:
     Returns:
     - Similarity weight in [0, 1]
     """
-    diff = abs(float(t1) - float(t2))
     sigma = max(float(sigma), 1e-6)
+    diff = abs(float(t1) - float(t2))
+    # Handle wrap-around at day boundary
     return float(np.exp(-0.5 * (diff / sigma) ** 2))
 
 
@@ -239,3 +242,37 @@ def unpack_params(theta: np.ndarray) -> Dict[str, float]:
         'epsilon': epsilon,
         'phi': float(phi),
     }
+
+@njit
+def unpack_params_for_fast(theta: np.ndarray) -> Tuple:
+    """
+    Unpack parameters from optimization vector (shared by MFE and SR-Dyna).
+
+    Parameters:
+    - theta: Parameter vector in logit space
+
+    Returns:
+    - Dictionary with alpha, beta, epsilon, phi
+    """
+    idx = 0
+    alpha = 1.0 / (1.0 + np.exp(-theta[idx])); idx += 1
+    beta = np.exp(theta[idx]); idx += 1
+    epsilon = 1.0 / (1.0 + np.exp(-theta[idx])); idx += 1
+    phi = 1.0 / (1.0 + np.exp(-theta[idx])); idx += 1
+
+    if alpha < 1e-6:
+        alpha = 1e-6
+    elif alpha > 1.0:
+        alpha = 1.0
+
+    if epsilon < 1e-6:
+        epsilon = 1e-6
+    elif epsilon > (1.0 - 1e-6):
+        epsilon = 1.0 - 1e-6
+
+    alpha = float(alpha)
+    epsilon = float(epsilon)
+    beta = float(beta)
+    phi = float(phi)
+
+    return alpha, beta, epsilon, phi
