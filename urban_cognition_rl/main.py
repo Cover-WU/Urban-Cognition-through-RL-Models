@@ -86,10 +86,10 @@ def _fit_single_mfe(args):
 
 def _fit_single_srdyna(args):
     """Helper function for parallel SR-Dyna fitting."""
-    user_id, user, config = args
+    user_id, user, config, high_performance = args
     try:
         user_df = user.to_dataframe()
-        result = fit_sr_dyna_model(user_df, config, verbose=False)
+        result = fit_sr_dyna_model(user_df, config, verbose=False, high_performance=high_performance)
         result['user_id'] = user_id
         return result
     except Exception as e:
@@ -207,6 +207,7 @@ def fit_mfe_for_all_users_parallel(users_dict: dict,
 def fit_sr_dyna_for_all_users_parallel(users_dict: dict,
                                         config: SRDynaConfig = None,
                                         sample_size: int = None,
+                                        high_performance: bool = False,
                                         n_jobs: int = -1,
                                         verbose: bool = True) -> pd.DataFrame:
     """Fit SR-Dyna model for all users in parallel.
@@ -227,13 +228,13 @@ def fit_sr_dyna_for_all_users_parallel(users_dict: dict,
     if not JOBLIB_AVAILABLE:
         if verbose:
             print("joblib not available, falling back to sequential processing")
-        return fit_sr_dyna_for_all_users(users_dict, config, sample_size, verbose)
+        return fit_sr_dyna_for_all_users(users_dict, config, sample_size, verbose, high_performance)
 
     user_ids = list(users_dict.keys())
     if sample_size is not None:
         user_ids = user_ids[:sample_size]
 
-    args_list = [(uid, users_dict[uid], config) for uid in user_ids]
+    args_list = [(uid, users_dict[uid], config, high_performance) for uid in user_ids]
 
     if verbose:
         print(f"Running parallel SR-Dyna fitting for {len(user_ids)} users using {n_jobs if n_jobs > 0 else 'all'} CPUs...")
@@ -321,6 +322,7 @@ def run_mfe_model(users_dict: dict, sample_size: int = None, config: MFEpiConfig
 
 
 def run_sr_dyna_model(users_dict: dict, sample_size: int = None, config: SRDynaConfig = None,
+                     high_performance: bool = False,
                      parallel: bool = True, n_jobs: int = -1) -> pd.DataFrame:
     """Run SR-Dyna model for all users.
 
@@ -339,8 +341,19 @@ def run_sr_dyna_model(users_dict: dict, sample_size: int = None, config: SRDynaC
         config = SRDynaConfig()
 
     if parallel and JOBLIB_AVAILABLE:
-        return fit_sr_dyna_for_all_users_parallel(users_dict, config=config, sample_size=sample_size, n_jobs=n_jobs)
-    return fit_sr_dyna_for_all_users(users_dict, config=config, sample_size=sample_size)
+        return fit_sr_dyna_for_all_users_parallel(
+            users_dict,
+            config=config,
+            sample_size=sample_size,
+            high_performance=high_performance,
+            n_jobs=n_jobs,
+        )
+    return fit_sr_dyna_for_all_users(
+        users_dict,
+        config=config,
+        sample_size=sample_size,
+        high_performance=high_performance,
+    )
 
 
 def main():
@@ -353,11 +366,11 @@ def main():
     users_dict = convert_to_users(df)
 
     # mf_results = run_mf_model(users_dict)
-    mfe_results = run_mfe_model(users_dict, sample_size=10, high_performance=True, parallel=False)
-    # srdyna_results = run_sr_dyna_model(users_dict, sample_size=10)
+    # mfe_results = run_mfe_model(users_dict, sample_size=10, high_performance=True, parallel=False)
+    srdyna_results = run_sr_dyna_model(users_dict, sample_size=10, high_performance=True, parallel=False)
 
     # return mf_results, mfe_results, srdyna_results
-    return mfe_results
+    return srdyna_results
 
 
 if __name__ == "__main__":

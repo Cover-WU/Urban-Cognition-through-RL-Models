@@ -17,6 +17,8 @@ import pandas as pd
 
 from .utils import compute_day_sequence, compute_time_angle, compute_reward_array, compute_time_kernel, prepare_trajectory_data, pack_params, unpack_params
 from .epi_memory import EntryRecord, EpisodicMemory
+from .srdyna_model_speed import simulate_and_loglik_sr_dyna as simulate_and_loglik_sr_dyna_fast
+from .srdyna_model_speed import _warmup_jit
 
 
 @dataclass
@@ -34,6 +36,7 @@ class SRDynaConfig:
     memory_threshold: float = 0.01
     selection_size: int = None
     sigma_t_init: float = 1.0 / 12.0
+    time_slots: int = 48
     maxiter: int = 1000
     ftol: float = 1e-6
 
@@ -412,7 +415,8 @@ def simulate_and_loglik_sr_dyna(theta: np.ndarray,
 
 def fit_sr_dyna_model(user_df: pd.DataFrame,
                      config: Optional[SRDynaConfig] = None,
-                     verbose: bool = True) -> Dict[str, Any]:
+                     verbose: bool = True,
+                     high_performance: bool = False) -> Dict[str, Any]:
     """Fit SR Dyna model for one user."""
     config = config if config is not None else SRDynaConfig()
 
@@ -441,15 +445,45 @@ def fit_sr_dyna_model(user_df: pd.DataFrame,
         phi=config.phi_init,
     )
 
+    if high_performance:
+        states = sr_data['states']
+        actions = sr_data['actions']
+        time_angles = sr_data['time_angles']
+        day_seq = sr_data['day_seq']
+        date_array = sr_data['date_array']
+        same_day_next = sr_data['same_day_next']
+        reward_array = sr_data['reward_array']
+        n_records = sr_data['n_records']
+        selection_size = int(sr_data['selection_size'])
+        sr_data_fast = (states, actions, time_angles, day_seq, date_array, same_day_next, n_records, reward_array)
+
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
-        result = minimize(
-            simulate_and_loglik_sr_dyna,
-            theta_init,
-            args=(sr_data, config),
-            method='L-BFGS-B',
-            options={'maxiter': config.maxiter, 'ftol': config.ftol, 'disp': False},
-        )
+        if high_performance:
+            _warmup_jit()
+            result = minimize(
+                simulate_and_loglik_sr_dyna_fast,
+                theta_init,
+                args=(
+                    sr_data_fast,
+                    selection_size,
+                    int(config.time_slots),
+                    float(config.sigma_t_init),
+                    int(config.visit_threshold),
+                    int(config.n_planning_steps),
+                    float(config.alpha_plan),
+                ),
+                method='L-BFGS-B',
+                options={'maxiter': config.maxiter, 'ftol': config.ftol, 'disp': False},
+            )
+        else:
+            result = minimize(
+                simulate_and_loglik_sr_dyna,
+                theta_init,
+                args=(sr_data, config),
+                method='L-BFGS-B',
+                options={'maxiter': config.maxiter, 'ftol': config.ftol, 'disp': False},
+            )
 
     fitted = unpack_params(result.x)
     log_likelihood = -float(result.fun)
@@ -486,7 +520,8 @@ def fit_sr_dyna_model(user_df: pd.DataFrame,
 def fit_sr_dyna_for_all_users(users_dict: Dict[int, Any],
                              config: Optional[SRDynaConfig] = None,
                              sample_size: Optional[int] = None,
-                             verbose: bool = True) -> pd.DataFrame:
+                             verbose: bool = True,
+                             high_performance: bool = False) -> pd.DataFrame:
     """Fit SR-Dyna model for all users."""
     config = config if config is not None else SRDynaConfig()
 
@@ -504,7 +539,7 @@ def fit_sr_dyna_for_all_users(users_dict: Dict[int, Any],
 
         try:
             t_start = time.time()
-            result = fit_sr_dyna_model(user_df, config, verbose=False)
+            result = fit_sr_dyna_model(user_df, config, verbose=False, high_performance=high_performance)
             elapsed = time.time() - t_start
             result['user_id'] = user_id
             result['fit_time_seconds'] = elapsed
