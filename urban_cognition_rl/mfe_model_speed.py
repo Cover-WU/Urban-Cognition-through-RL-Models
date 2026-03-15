@@ -90,6 +90,7 @@ class QMemory:
 
     def encode(self, node_id: int, action_id: int, time_angle: float, q_value: float):
         """Encode new memory record with incremental update."""
+        action_id = action_id if action_id != -9 else -1
         time_slot = self.time_slot_mapping(time_angle, self.time_slots)
         
         current_Q = self.q_table[node_id, action_id, time_slot]
